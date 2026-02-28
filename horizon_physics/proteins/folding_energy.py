@@ -1,0 +1,272 @@
+"""
+Folding energy E_tot from HQIV: minimization for peptides/proteins.
+
+E_tot = Σ m c² + Σ ħ c / Θ_i (informational-energy) plus geometric damping
+f_φ = −γ′ φ / (a_loc + φ/6)² ∇φ and solvent-excluded volume (via φ).
+Simple rigorous minimizer: gradient descent on E_tot with Θ_i and φ from
+lattice positions. No force fields; all from first principles.
+
+Returns: energy in eV (or relative units), minimized coordinates. MIT License, Python 3.10+, numpy only.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from typing import Dict, Tuple, Optional
+
+from ._hqiv_base import (
+    theta_local,
+    horizon_scalar,
+    damping_force_magnitude,
+    A_LOC_ANG,
+    HBAR_C_EV_ANG,
+)
+from .peptide_backbone import backbone_geometry
+
+def theta_at_position(positions: np.ndarray, i: int, z_shell: int, coordination: int = 2) -> float:
+    """
+    Θ at node i from position (diamond size from nearest-neighbor distances).
+    Θ_local = base Θ scaled by local density: higher density → smaller Θ (monogamy).
+    """
+    base = theta_local(z_shell, coordination)
+    if positions.shape[0] < 2:
+        return base
+    d = np.linalg.norm(positions - positions[i], axis=1)
+    d[i] = np.inf
+    r_min = np.min(d)
+    # Local crowding: Θ effective = base * min(1, r_min / r_ref)
+    r_ref = 2.0
+    return base * min(1.0, r_min / r_ref)
+
+
+# Horizon radius for full vector summation (Å); pairs beyond this don't contribute
+R_HORIZON = 15.0
+
+
+def grad_horizon_full(
+    positions: np.ndarray,
+    z_list: np.ndarray,
+    r_ref: float = 2.0,
+    r_horizon: float = R_HORIZON,
+    k_horizon: float = 0.5 * HBAR_C_EV_ANG,
+) -> np.ndarray:
+    """
+    Full vector sum of horizon forces: every atom j contributes to i.
+    F_i += pot(r_ij) * unit_vector(i→j) with pot from Θ_ij, φ.
+    Repulsive crowding: grad[i] -= pot * unit (push i away from close j).
+    O(n²) over pairs within r_horizon.
+    """
+    n = positions.shape[0]
+    grad = np.zeros_like(positions)
+    base = theta_local(6, 2)  # Cα
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = positions[j] - positions[i]
+            r = np.linalg.norm(d)
+            if r < 1e-9 or r > r_horizon:
+                continue
+            unit = d / r
+            theta_ij = base * min(1.0, r / r_ref)
+            phi = horizon_scalar(theta_ij)
+            pot = k_horizon * phi / (theta_ij + 1e-9)
+            grad[i] -= pot * unit
+            grad[j] += pot * unit
+    return grad
+
+
+def e_tot_informational(positions: np.ndarray, z_list: np.ndarray) -> float:
+    """
+    Σ ħ c / Θ_i for all atoms. positions (n, 3) Å, z_list (n) Z_shell.
+    """
+    n = positions.shape[0]
+    e = 0.0
+    for i in range(n):
+        theta_i = theta_at_position(positions, i, int(z_list[i]))
+        if theta_i > 0:
+            e += HBAR_C_EV_ANG / theta_i
+    return e
+
+
+def e_tot_damping(positions: np.ndarray, z_list: np.ndarray, a_loc: float = A_LOC_ANG) -> float:
+    """
+    Contribution from f_φ: potential energy associated with φ gradient.
+    U_φ ∝ ∫ f_φ·dr ~ Σ_i φ_i / (a_loc + φ_i/6) over neighbors.
+    """
+    n = positions.shape[0]
+    u = 0.0
+    for i in range(n):
+        theta_i = theta_at_position(positions, i, int(z_list[i]))
+        phi_i = horizon_scalar(theta_i)
+        denom = a_loc + phi_i / 6.0
+        if denom > 0:
+            u += phi_i / denom
+    return u
+
+
+def e_tot(positions: np.ndarray, z_list: np.ndarray) -> float:
+    """
+    Total folding energy: E_tot = Σ ħc/Θ_i + λ_damp * U_φ.
+    """
+    e_info = e_tot_informational(positions, z_list)
+    e_damp = e_tot_damping(positions, z_list)
+    lambda_damp = 0.1 * HBAR_C_EV_ANG
+    return e_info + lambda_damp * e_damp
+
+
+# Bond/clash from HQIV: Cα–Cα step ~3.8 Å (Θ from lattice); bonding range [r_min, r_max]
+R_CA_CA_EQ = 3.8   # Å, from extended (3.2) and helix contour (5.4) compromise
+R_BOND_MIN = 2.5   # Å, below = clash
+R_BOND_MAX = 6.0   # Å, above = broken chain
+R_CLASH = 2.0      # Å, non-bonded atoms closer = clash
+K_BOND = 200.0 * HBAR_C_EV_ANG  # strong penalty to keep chain intact
+K_CLASH = 500.0 * HBAR_C_EV_ANG
+
+
+def e_tot_ca_with_bonds(
+    positions: np.ndarray,
+    z_list: np.ndarray,
+    r_eq: float = R_CA_CA_EQ,
+    r_min: float = R_BOND_MIN,
+    r_max: float = R_BOND_MAX,
+    r_clash: float = R_CLASH,
+    k_bond: float = K_BOND,
+    k_clash: float = K_CLASH,
+) -> float:
+    """
+    E_tot + bond-length penalty (consecutive Cα) + clash penalty (non-bonded pairs).
+    First principles: atoms "close enough to bond" when r in [r_min, r_max];
+    below r_clash for non-bonded = clash. Keeps chain from exploding.
+    """
+    e = e_tot(positions, z_list)
+    n = positions.shape[0]
+    # Bond penalty
+    d = positions[1:] - positions[:-1]
+    r = np.linalg.norm(d, axis=1)
+    r = np.where(r < 1e-12, 1.0, r)
+    terms = np.where(r < r_min, (r_min - r) ** 2, np.where(r > r_max, (r - r_max) ** 2, 0.1 * (r - r_eq) ** 2))
+    e += float(k_bond * np.sum(terms))
+    # Clash penalty: vectorized (windowed)
+    window = min(20, n)
+    for j in range(2, window + 1):
+        for i in range(n - j):
+            r = np.linalg.norm(positions[i + j] - positions[i])
+            if r < r_clash:
+                e += k_clash * (r_clash - r) ** 2
+    return e
+
+
+def grad_bonds_only(
+    positions: np.ndarray,
+    r_eq: float = R_CA_CA_EQ,
+    r_min: float = R_BOND_MIN,
+    r_max: float = R_BOND_MAX,
+    r_clash: float = R_CLASH,
+    k_bond: float = K_BOND,
+    k_clash: float = K_CLASH,
+    include_clash: bool = False,
+) -> np.ndarray:
+    """
+    Analytical gradient of bond penalty (and optionally clash). O(n) for bonds.
+    Used for fast minimization of long chains without finite differences.
+    """
+    n = positions.shape[0]
+    grad = np.zeros_like(positions)
+    for i in range(n - 1):
+        d = positions[i + 1] - positions[i]
+        r = np.linalg.norm(d)
+        if r < 1e-12:
+            continue
+        u = d / r
+        if r < r_min:
+            g = -2 * k_bond * (r_min - r)
+        elif r > r_max:
+            g = 2 * k_bond * (r - r_max)
+        else:
+            g = 2 * k_bond * 0.1 * (r - r_eq)
+        grad[i] -= g * u
+        grad[i + 1] += g * u
+    if include_clash:
+        window = min(20, n)
+        for j in range(2, window + 1):
+            for i in range(n - j):
+                d = positions[i + j] - positions[i]
+                r = np.linalg.norm(d)
+                if r < r_clash and r > 1e-12:
+                    g = -2 * k_clash * (r_clash - r)
+                    u = d / r
+                    grad[i] -= g * u
+                    grad[i + j] += g * u
+    return grad
+
+
+def grad_full(
+    positions: np.ndarray,
+    z_list: np.ndarray,
+    include_bonds: bool = True,
+    include_horizon: bool = True,
+    **kwargs,
+) -> np.ndarray:
+    """
+    Combined gradient: bonds (i,i+1) + full vector sum from all j within horizon.
+    Use in fast path for long chains so long-range crowding accumulates.
+    """
+    grad = np.zeros_like(positions)
+    if include_bonds:
+        grad += grad_bonds_only(positions, **{k: v for k, v in kwargs.items() if k in ("r_eq", "r_min", "r_max", "r_clash", "k_bond", "k_clash", "include_clash")})
+    if include_horizon:
+        grad += grad_horizon_full(positions, z_list, **{k: v for k, v in kwargs.items() if k in ("r_ref", "r_horizon", "k_horizon")})
+    return grad
+
+
+def minimize_e_tot(
+    positions_init: np.ndarray,
+    z_list: np.ndarray,
+    steps: int = 200,
+    step_size: float = 0.01,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Deterministic gradient descent on E_tot (no random seed). positions_init (n, 3) Å, z_list (n).
+    Returns (positions_opt, {"e_final": ..., "e_initial": ...}).
+    For L-BFGS (recommended), use gradient_descent_folding.minimize_e_tot_lbfgs.
+    """
+    pos = np.array(positions_init, dtype=float)
+    e0 = e_tot(pos, z_list)
+    n = pos.shape[0]
+    for _ in range(steps):
+        grad = np.zeros_like(pos)
+        for j in range(n):
+            for d in range(3):
+                pos[j, d] += 1e-5
+                e_plus = e_tot(pos, z_list)
+                pos[j, d] -= 2e-5
+                e_minus = e_tot(pos, z_list)
+                pos[j, d] += 1e-5
+                grad[j, d] = (e_plus - e_minus) / (2e-5)
+        pos -= step_size * grad
+    e_final = e_tot(pos, z_list)
+    return pos, {"e_final": e_final, "e_initial": e0}
+
+
+def small_peptide_energy(sequence: str) -> Dict[str, float]:
+    """
+    E_tot for a small peptide: backbone-only Cα trace, Z=6 for Cα.
+    sequence: one-letter amino acids. Returns {"e_tot": ..., "per_residue": ...}.
+    """
+    n = len(sequence)
+    # Simple linear chain spacing 3.8 Å (extended)
+    positions = np.zeros((n, 3))
+    positions[:, 0] = np.arange(n) * 3.8
+    z_list = np.full(n, 6)
+    e = e_tot(positions, z_list)
+    return {"e_tot": e, "per_residue": e / n if n else 0.0}
+
+
+if __name__ == "__main__":
+    # 3 Cα chain
+    pos0 = np.array([[0.0, 0, 0], [3.8, 0, 0], [7.6, 0, 0]])
+    z = np.array([6, 6, 6])
+    pos_opt, info = minimize_e_tot(pos0, z, steps=100)
+    print("Folding energy (HQIV E_tot minimizer)")
+    print(f"  E_initial: {info['e_initial']:.2f} eV, E_final: {info['e_final']:.2f} eV")
+    pep = small_peptide_energy("AAA")
+    print(f"  Small peptide AAA: E_tot={pep['e_tot']:.2f} eV")
