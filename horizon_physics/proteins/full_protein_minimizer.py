@@ -24,6 +24,7 @@ from .casp_submission import (
 from .folding_energy import e_tot, e_tot_ca_with_bonds, grad_full, grad_bonds_only
 from .gradient_descent_folding import minimize_e_tot_lbfgs, _project_bonds
 from .peptide_backbone import backbone_bond_lengths
+from .side_chain_placement import chi_angles_for_residue, side_chain_chi_preferences
 
 # Z_shell for E_tot over full backbone: N=7, C=6, O=8
 Z_N, Z_CA, Z_C, Z_O = 7, 6, 6, 8
@@ -180,6 +181,32 @@ def minimize_full_chain(
     }
 
 
+def pack_sidechains(
+    result: Dict[str, object],
+    r_clash: float = 2.0,
+    lbfgs_steps: int = 5,
+) -> Dict[str, object]:
+    """
+    Run side-chain rotamer packing on an existing minimize_full_chain result.
+
+    Uses side_chain_chi_preferences() for χ1: grid search (pref ±120°, ±60°, 0°) then
+    L-BFGS on χ1 to minimize clash energy. Pushes lDDT up and all-atom RMSD down.
+    Requires result["include_sidechains"]; otherwise returns result unchanged.
+    """
+    if not result.get("include_sidechains") or not result.get("backbone_atoms"):
+        return result
+    seq = result["sequence"]
+    packed = _side_chain_pack_light(
+        list(result["backbone_atoms"]),
+        seq,
+        r_clash=r_clash,
+        lbfgs_steps=lbfgs_steps,
+    )
+    out = dict(result)
+    out["backbone_atoms"] = packed
+    return out
+
+
 def _rotate_vector_around_axis(v: np.ndarray, axis: np.ndarray, deg: float) -> np.ndarray:
     """Rotate vector v around axis by deg (degrees). Axis need not be unit."""
     axis = np.asarray(axis, dtype=float)
@@ -196,32 +223,44 @@ def _side_chain_pack_light(
     backbone_atoms: List[Tuple[str, np.ndarray]],
     sequence: str,
     r_clash: float = 2.0,
+    lbfgs_steps: int = 5,
 ) -> List[Tuple[str, np.ndarray]]:
     """
-    Lightweight Cβ rotamer search: try 3 rotations (0°, 120°, 240°) around N–CA;
-    keep the orientation with fewest clashes. Improves surface packing / lDDT.
+    Side-chain packing: (1) grid search on χ1 using chi_angles_for_residue preferences;
+    (2) 3–5 L-BFGS steps on χ1 vector for fine-tuning. Improves lDDT / surface packing.
     """
     out = list(backbone_atoms)
     all_xyz = np.array([xyz for _, xyz in out])
     n_res = len(sequence)
+    bonds = backbone_bond_lengths()
+    r_ca_cb = bonds["Calpha_Cbeta"]
+    chi_prefs = side_chain_chi_preferences()
     idx = 0
+    cb_res_indices: List[int] = []
+    cb_atom_indices: List[int] = []
     for res_i in range(n_res):
         aa = sequence[res_i]
         if aa == "G":
             idx += 4
             continue
-        # Order: N, CA, CB, C, O
         i_n, i_ca, i_cb = idx, idx + 1, idx + 2
         idx += 5
+        cb_res_indices.append(res_i)
+        cb_atom_indices.append(i_cb)
         n_xyz = out[i_n][1]
         ca_xyz = out[i_ca][1]
+        c_xyz = out[i_cb + 2][1]
         cb_xyz = out[i_cb][1]
+        chi1_pref = chi_prefs.get(AA_1to3.get(aa, "ALA"), {}).get("chi1_deg")
+        if chi1_pref is None:
+            chi1_pref = 60.0
+        grid = [chi1_pref + d for d in (-120.0, -60.0, 0.0, 60.0, 120.0)]
+        v0 = _default_cb_vector(n_xyz, ca_xyz, c_xyz, r_ca_cb)
         axis = ca_xyz - n_xyz
-        v_ca_cb = cb_xyz - ca_xyz
         best_cb = cb_xyz
         best_count = _count_clashes(cb_xyz, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash)
-        for angle in (120.0, 240.0):
-            v_rot = _rotate_vector_around_axis(v_ca_cb, axis, angle)
+        for chi1 in grid:
+            v_rot = _rotate_vector_around_axis(v0, axis, chi1)
             cb_new = ca_xyz + v_rot
             count = _count_clashes(cb_new, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash)
             if count < best_count:
@@ -229,7 +268,188 @@ def _side_chain_pack_light(
                 best_cb = cb_new
         out[i_cb] = ("CB", best_cb)
         all_xyz[i_cb] = best_cb
+    if lbfgs_steps > 0 and cb_res_indices:
+        chi_vec = _pack_lbfgs(out, sequence, cb_res_indices, cb_atom_indices, r_ca_cb, r_clash, lbfgs_steps)
+        out = _apply_chi_vec(out, sequence, chi_vec, cb_res_indices, cb_atom_indices, r_ca_cb)
     return out
+
+
+def _default_cb_vector(n_xyz: np.ndarray, ca_xyz: np.ndarray, c_xyz: np.ndarray, r_ca_cb: float) -> np.ndarray:
+    """Default CA→Cβ vector (trans from N–CA–C plane)."""
+    v1 = n_xyz - ca_xyz
+    v2 = c_xyz - ca_xyz
+    direction = np.cross(v1, v2)
+    nrm = np.linalg.norm(direction)
+    if nrm < 1e-9:
+        direction = np.array([1.0, 0.0, 0.0])
+    else:
+        direction = direction / nrm
+    return r_ca_cb * direction
+
+
+def _apply_chi_vec(
+    atoms: List[Tuple[str, np.ndarray]],
+    sequence: str,
+    chi_vec: np.ndarray,
+    cb_res_indices: List[int],
+    cb_atom_indices: List[int],
+    r_ca_cb: float,
+) -> List[Tuple[str, np.ndarray]]:
+    """Apply chi1 vector to update Cβ positions."""
+    out = list(atoms)
+    for k, res_i in enumerate(cb_res_indices):
+        i_cb = cb_atom_indices[k]
+        i_n = i_cb - 2
+        i_ca = i_cb - 1
+        i_c = i_cb + 2
+        n_xyz = out[i_n][1]
+        ca_xyz = out[i_ca][1]
+        c_xyz = out[i_c][1]
+        v0 = _default_cb_vector(n_xyz, ca_xyz, c_xyz, r_ca_cb)
+        axis = ca_xyz - n_xyz
+        v_rot = _rotate_vector_around_axis(v0, axis, float(chi_vec[k]))
+        out[i_cb] = ("CB", ca_xyz + v_rot)
+    return out
+
+
+def _pack_lbfgs(
+    atoms: List[Tuple[str, np.ndarray]],
+    sequence: str,
+    cb_res_indices: List[int],
+    cb_atom_indices: List[int],
+    r_ca_cb: float,
+    r_clash: float,
+    max_iter: int,
+) -> np.ndarray:
+    """3–5 L-BFGS steps on χ1 vector to minimize clash energy."""
+    n_chi = len(cb_res_indices)
+    chi_vec = np.zeros(n_chi)
+    for k, res_i in enumerate(cb_res_indices):
+        i_cb = cb_atom_indices[k]
+        i_n, i_ca, i_c = i_cb - 2, i_cb - 1, i_cb + 2
+        n_xyz = atoms[i_n][1]
+        ca_xyz = atoms[i_ca][1]
+        c_xyz = atoms[i_c][1]
+        cb_xyz = atoms[i_cb][1]
+        v0 = _default_cb_vector(n_xyz, ca_xyz, c_xyz, r_ca_cb)
+        axis = ca_xyz - n_xyz
+        v_cb = cb_xyz - ca_xyz
+        chi_vec[k] = _chi1_from_vectors(v0, v_cb, axis)
+    k_clash = 500.0
+    s_list: list[np.ndarray] = []
+    y_list: list[np.ndarray] = []
+    for it in range(max_iter):
+        e, grad = _chi_clash_and_grad(atoms, sequence, chi_vec, cb_res_indices, cb_atom_indices, r_ca_cb, r_clash, k_clash)
+        g_norm = np.linalg.norm(grad)
+        if g_norm < 1e-4:
+            break
+        if len(s_list) >= 5:
+            s_list.pop(0)
+            y_list.pop(0)
+        if len(s_list) == 0:
+            direction = -grad
+        else:
+            direction = _lbfgs_chi(grad, s_list, y_list)
+        step = 1.0
+        e_curr = e
+        for _ in range(20):
+            chi_new = chi_vec + step * direction
+            e_new, _ = _chi_clash_and_grad(
+                atoms, sequence, chi_new, cb_res_indices, cb_atom_indices, r_ca_cb, r_clash, k_clash,
+            )
+            if e_new <= e_curr + 1e-4 * step * np.dot(grad, direction):
+                break
+            step *= 0.5
+        _, grad_new = _chi_clash_and_grad(
+            atoms, sequence, chi_new, cb_res_indices, cb_atom_indices, r_ca_cb, r_clash, k_clash,
+        )
+        s_list.append(chi_new - chi_vec)
+        y_list.append(grad_new - grad)
+        chi_vec = chi_new
+    return chi_vec
+
+
+def _lbfgs_chi(grad: np.ndarray, s_list: list, y_list: list, m: int = 5) -> np.ndarray:
+    """L-BFGS two-loop for chi vector."""
+    q = -grad.copy()
+    n_vec = len(s_list)
+    if n_vec == 0:
+        return -grad
+    alpha_list = []
+    for i in range(n_vec - 1, -1, -1):
+        rho = 1.0 / (np.dot(y_list[i], s_list[i]) + 1e-14)
+        alpha_list.append(rho * np.dot(s_list[i], q))
+        q = q - alpha_list[-1] * y_list[i]
+    gamma = np.dot(y_list[-1], s_list[-1]) / (np.dot(y_list[-1], y_list[-1]) + 1e-14)
+    r = gamma * q
+    for i in range(n_vec):
+        rho = 1.0 / (np.dot(y_list[i], s_list[i]) + 1e-14)
+        beta = rho * np.dot(y_list[i], r)
+        r = r + s_list[i] * (alpha_list[n_vec - 1 - i] - beta)
+    return r
+
+
+def _chi1_from_vectors(v0: np.ndarray, v_cb: np.ndarray, axis: np.ndarray) -> float:
+    """Recover chi1 (deg) from v0 and current v_cb = CB - CA. Axis = CA - N."""
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    v0_n = v0 / (np.linalg.norm(v0) + 1e-12)
+    v_cb_n = v_cb / (np.linalg.norm(v_cb) + 1e-12)
+    dot = np.clip(np.dot(v0_n, v_cb_n), -1, 1)
+    angle_rad = np.arccos(dot)
+    cross = np.cross(v0_n, v_cb_n)
+    sign = 1.0 if np.dot(axis, cross) >= 0 else -1.0
+    return float(np.rad2deg(sign * angle_rad))
+
+
+def _chi_clash_and_grad(
+    atoms: List[Tuple[str, np.ndarray]],
+    sequence: str,
+    chi_vec: np.ndarray,
+    cb_res_indices: List[int],
+    cb_atom_indices: List[int],
+    r_ca_cb: float,
+    r_clash: float,
+    k_clash: float,
+) -> Tuple[float, np.ndarray]:
+    """Clash energy and analytical gradient w.r.t. chi_vec (degrees)."""
+    atoms_applied = _apply_chi_vec(atoms, sequence, chi_vec, cb_res_indices, cb_atom_indices, r_ca_cb)
+    all_xyz = np.array([xyz for _, xyz in atoms_applied])
+    n_chi = len(cb_res_indices)
+    e = 0.0
+    grad = np.zeros(n_chi)
+    deg2rad = np.pi / 180.0
+    for k, res_i in enumerate(cb_res_indices):
+        i_cb = cb_atom_indices[k]
+        i_n, i_ca, i_c = i_cb - 2, i_cb - 1, i_cb + 2
+        n_xyz = atoms[i_n][1]
+        ca_xyz = atoms[i_ca][1]
+        c_xyz = atoms[i_c][1]
+        v0 = _default_cb_vector(n_xyz, ca_xyz, c_xyz, r_ca_cb)
+        axis = ca_xyz - n_xyz
+        axis_n = axis / (np.linalg.norm(axis) + 1e-12)
+        chi_rad = chi_vec[k] * deg2rad
+        cb_xyz = all_xyz[i_cb]
+        v_cb = cb_xyz - ca_xyz
+        dpos_dchi = _drot_dchi(v0, axis_n, chi_rad) * deg2rad
+        for j in range(len(all_xyz)):
+            if j in (i_n, i_ca, i_cb):
+                continue
+            d = all_xyz[j] - cb_xyz
+            r = np.linalg.norm(d)
+            if r < 1e-9:
+                continue
+            if r < r_clash:
+                e += k_clash * (r_clash - r) ** 2
+                u = d / r
+                g = -2 * k_clash * (r_clash - r)
+                grad[k] += g * np.dot(u, dpos_dchi)
+    return e, grad
+
+
+def _drot_dchi(v: np.ndarray, axis: np.ndarray, chi_rad: float) -> np.ndarray:
+    """d/d(chi_rad) of R(chi)*v for rotation around axis."""
+    c, s = np.cos(chi_rad), np.sin(chi_rad)
+    return -v * s + np.cross(axis, v) * c + axis * np.dot(axis, v) * s
 
 
 def _count_clashes(

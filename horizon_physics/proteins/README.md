@@ -117,7 +117,7 @@ pdb_str = full_chain_to_pdb(result, chain_id="A")
 
 - **Gradients:** Analytical everywhere (`grad_bonds_only` + `grad_horizon_full`); no finite differences in L-BFGS or fast path.
 - **Horizon:** Default = full vector sum over all pairs within horizon radius. Use `fast_horizon=True` (or CLI `--fast`) for bonds-only / nearest-neighbor (faster, for debugging).
-- **Side-chain pack:** If `include_sidechains=True`, a lightweight Cβ rotamer search (0°, 120°, 240° around N–CA) runs after backbone minimization; disable with `side_chain_pack=False`.
+- **Side-chain pack:** If `include_sidechains=True`, rotamer packing runs after backbone: χ1 from `side_chain_chi_preferences()` (grid pref±120°, ±60°, 0°) then 5 L-BFGS steps on χ1 to minimize clash energy. Disable with `side_chain_pack=False`. Optional standalone: `pack_sidechains(result)`.
 
 ### CASP submission: FASTA → PDB (SS-aware)
 
@@ -164,7 +164,7 @@ python -m horizon_physics.proteins.validation
 
 - **Analytical gradients:** All minimization uses analytical gradients (`grad_bonds_only` for consecutive Cα–Cα bonds; `grad_horizon_full` for the full vector sum of horizon forces from every atom j to i within 15 Å). No finite-difference gradients.
 - **Default horizon:** Full vector-sum horizon (long-range crowding) is the default. Use `fast_horizon=True` or `--fast` for bonds-only (nearest-neighbor only), which is faster and useful for debugging.
-- **Side-chain packing:** After backbone minimization, if side chains are requested, a lightweight Cβ rotamer search runs: for each non-Gly residue, try three Cβ orientations (0°, 120°, 240° around N–CA) and keep the one with fewest clashes. This improves surface packing and lDDT.
+- **Side-chain packing:** After backbone minimization, χ1 is optimized using `side_chain_chi_preferences()`: grid search (pref ±120°, ±60°, 0°) then L-BFGS on the χ1 vector to minimize clash energy. Uses existing geometry (N–CA–Cβ). Improves lDDT and all-atom RMSD; run standalone with `pack_sidechains(result)` on an existing result.
 
 ## License
 

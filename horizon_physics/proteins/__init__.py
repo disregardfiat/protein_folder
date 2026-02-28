@@ -37,7 +37,7 @@ from .secondary_structure_predictor import (
     theta_eff_residue,
     preferred_basin_phi_psi,
 )
-from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb
+from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb, pack_sidechains
 
 __all__ = [
     "hqiv_alpha_helix",
@@ -70,4 +70,5 @@ __all__ = [
     "preferred_basin_phi_psi",
     "minimize_full_chain",
     "full_chain_to_pdb",
+    "pack_sidechains",
 ]
