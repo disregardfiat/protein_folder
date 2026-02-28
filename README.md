@@ -1,6 +1,7 @@
 # PROtien — HQIV Protein Folding
 
 First-principles protein structure prediction from the **Horizon-centric Quantum Information and Vacuum (HQIV)** framework. No empirical force fields, no PDB statistics.
+HQIV => https://zenodo.org/records/18794890
 
 ## Quick start
 
