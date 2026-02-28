@@ -119,6 +119,34 @@ pdb_str = full_chain_to_pdb(result, chain_id="A")
 - **Horizon:** Default = full vector sum over all pairs within horizon radius. Use `fast_horizon=True` (or CLI `--fast`) for bonds-only / nearest-neighbor (faster, for debugging).
 - **Side-chain pack:** If `include_sidechains=True`, rotamer packing runs after backbone: χ1 from `side_chain_chi_preferences()` (grid pref±120°, ±60°, 0°) then 5 L-BFGS steps on χ1 to minimize clash energy. Disable with `side_chain_pack=False`. Optional standalone: `pack_sidechains(result)`.
 
+### Current algorithm (full-chain pipeline)
+
+The pipeline used by `minimize_full_chain` is:
+
+1. **Sequence** — Parse FASTA or use the one-letter sequence; validate against the 20 standard amino acids.
+
+2. **Secondary structure** — Predict per-residue SS (H/E/C) from Θ_eff and E_tot(φ,ψ) basins (no ML). Optional window majority vote. If no `ss_string` is provided, `predict_ss(sequence)` is used.
+
+3. **Initial Cα placement** — Place Cα segment-by-segment from N→C:
+   - **H**: helix geometry (rise 3/2 Å, pitch 27/5 Å from HQIV).
+   - **E/C**: extended/coil (rise 3.2 Å / 3.0 Å).
+   - Segments are stitched by aligning the segment start direction to the previous segment end; no bond-length sweep at this stage.
+
+4. **Cα minimization** — Minimize an effective energy (bond penalty + horizon forces) over the Cα trace:
+   - **Bonds:** Consecutive Cα–Cα penalized outside [2.5, 6.0] Å; soft minimum near 3.8 Å. Gradient from `build_bond_poles` (analytical).
+   - **Horizon:** Full vector sum of repulsive forces from every atom j to i within horizon radius (12–15 Å). Each pair contributes a **bond potential vector (pole)** (i→j); gradient from `build_horizon_poles` or `grad_horizon_full`. A **neighbor list** (12 Å) limits pairs to nearby atoms for speed.
+   - **Combined gradient:** Analytical only (`grad_bonds_only` + `grad_horizon_full`); no finite differences. Optional `fast_horizon`: use bonds-only (nearest-neighbor) for debugging.
+   - **Step:** Gradient descent with adaptive step; after each step, **project** consecutive bonds into [2.5, 6.0] Å.
+   - **Paths:** For n_res > 50, a fast path (bonds + horizon, ~30 iter) is used; for shorter chains, L-BFGS with the same analytical gradient and bond projection.
+
+5. **Backbone rebuild** — From minimized Cα, place N, CA, C, O per residue using local tangent and HQIV bond lengths (N–CA, CA–C, C–O).
+
+6. **Side chains (optional)** — If `include_sidechains=True`: add Cβ from N–CA–C plane (trans); then **side-chain packing**: χ1 from `side_chain_chi_preferences()`, grid (pref ±120°, ±60°, 0°), then a short L-BFGS on the χ1 vector to minimize Cβ clash energy.
+
+7. **Output** — Result dict (e.g. `ca_min`, `backbone_atoms`, energies, `info`); `full_chain_to_pdb(result)` writes MODEL 1 … ENDMDL END.
+
+Poles (bond potential vectors) can be stored per minimization step: `build_horizon_poles`, `build_bond_poles`, and `grad_from_poles` let you keep and reuse the ± vectors per (i, j).
+
 ### CASP submission: FASTA → PDB (SS-aware)
 
 ```python
@@ -159,6 +187,23 @@ python -m horizon_physics.proteins.validation
 
 - **Crambin**: `examples/crambin.py` — 46 residues, full backbone PDB.
 - **Insulin fragment**: `examples/insulin_fragment.py` — B-chain 1–30.
+
+### Bond potential vectors (poles)
+
+Each horizon or chain bond is represented as a **pole**: a bond potential vector with a ± convention. A pole is `(i, j, vec)` where `vec` points from atom `i` toward atom `j`; the force on `i` is −`vec`, on `j` is +`vec`. You can build and store poles for reuse (e.g. per minimization step):
+
+```python
+from horizon_physics.proteins import build_horizon_poles, build_bond_poles, grad_from_poles
+
+# Horizon poles (all pairs within cutoff)
+poles_h = build_horizon_poles(positions, z_list)
+# Chain bonds only (consecutive Cα–Cα)
+poles_b = build_bond_poles(positions)
+# Reconstruct gradient from any list of poles
+grad = grad_from_poles(poles_b + poles_h, n)
+```
+
+`grad_horizon_full(..., return_poles=True)` returns `(grad, poles)` so you can keep the horizon poles for the current step.
 
 ## Implementation notes
 

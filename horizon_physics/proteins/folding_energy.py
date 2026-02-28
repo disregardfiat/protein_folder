@@ -12,7 +12,7 @@ Returns: energy in eV (or relative units), minimized coordinates. MIT License, P
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ._hqiv_base import (
     theta_local,
@@ -45,6 +45,11 @@ CUTOFF = 12.0  # Å — neighbor list; horizon forces decay rapidly beyond this
 USE_NEIGHBOR_LIST = True
 
 
+# Bond potential vector (pole): direction and magnitude along i→j; − at i, + at j
+def _pole(i: int, j: int, vec: np.ndarray) -> Tuple[int, int, np.ndarray]:
+    return (i, j, np.asarray(vec, dtype=float))
+
+
 def build_neighbor_list(pos: np.ndarray, cutoff: float = CUTOFF) -> list:
     """Pairs within cutoff; neigh[i] = [(j, r, unit), ...] for j > i only."""
     n = len(pos)
@@ -60,24 +65,23 @@ def build_neighbor_list(pos: np.ndarray, cutoff: float = CUTOFF) -> list:
     return neigh
 
 
-def grad_horizon_full(
+def build_horizon_poles(
     positions: np.ndarray,
     z_list: np.ndarray,
     r_ref: float = 2.0,
     r_horizon: float = R_HORIZON,
     k_horizon: float = 0.5 * HBAR_C_EV_ANG,
     use_neighbor_list: bool = USE_NEIGHBOR_LIST,
-) -> np.ndarray:
+) -> List[Tuple[int, int, np.ndarray]]:
     """
-    Full vector sum of horizon forces: every atom j contributes to i.
-    F_i += pot(r_ij) * unit_vector(i→j) with pot from Θ_ij, φ.
-    Repulsive crowding: grad[i] -= pot * unit (push i away from close j).
-    With neighbor list (default): O(n·k) for k neighbors within cutoff; 3–8× faster on long chains.
+    Build bond potential vectors (poles) for horizon forces. Each pole is (i, j, vec)
+    with vec pointing i→j: force on i is −vec, on j is +vec.
+    Returns list of poles for all pairs within cutoff.
     """
     n = positions.shape[0]
-    grad = np.zeros_like(positions)
-    base = theta_local(6, 2)  # Cα
+    base = theta_local(6, 2)
     cutoff = min(r_horizon, CUTOFF) if use_neighbor_list else r_horizon
+    poles: List[Tuple[int, int, np.ndarray]] = []
     if use_neighbor_list:
         neigh = build_neighbor_list(positions, cutoff=cutoff)
         for i in range(n):
@@ -85,8 +89,8 @@ def grad_horizon_full(
                 theta_ij = base * min(1.0, r / r_ref)
                 phi = horizon_scalar(theta_ij)
                 pot = k_horizon * phi / (theta_ij + 1e-9)
-                grad[i] -= pot * unit
-                grad[j] += pot * unit
+                vec = pot * unit  # i→j: − at i, + at j
+                poles.append(_pole(i, j, vec))
     else:
         for i in range(n):
             for j in range(i + 1, n):
@@ -98,8 +102,45 @@ def grad_horizon_full(
                 theta_ij = base * min(1.0, r / r_ref)
                 phi = horizon_scalar(theta_ij)
                 pot = k_horizon * phi / (theta_ij + 1e-9)
-                grad[i] -= pot * unit
-                grad[j] += pot * unit
+                vec = pot * unit
+                poles.append(_pole(i, j, vec))
+    return poles
+
+
+def grad_from_poles(poles: List[Tuple[int, int, np.ndarray]], n: int) -> np.ndarray:
+    """Accumulate gradient from stored pole vectors: −vec at i, +vec at j."""
+    grad = np.zeros((n, 3))
+    for i, j, vec in poles:
+        grad[i] -= vec
+        grad[j] += vec
+    return grad
+
+
+def grad_horizon_full(
+    positions: np.ndarray,
+    z_list: np.ndarray,
+    r_ref: float = 2.0,
+    r_horizon: float = R_HORIZON,
+    k_horizon: float = 0.5 * HBAR_C_EV_ANG,
+    use_neighbor_list: bool = USE_NEIGHBOR_LIST,
+    return_poles: bool = False,
+):
+    """
+    Full vector sum of horizon forces: every atom j contributes to i.
+    F_i += pot(r_ij) * unit_vector(i→j) with pot from Θ_ij, φ.
+    Repulsive crowding: grad[i] -= pot * unit (push i away from close j).
+    With neighbor list (default): O(n·k) for k neighbors within cutoff; 3–8× faster on long chains.
+    If return_poles=True, returns (grad, poles) where poles is a list of (i, j, vec) bond potential
+    vectors (vec points i→j; − at i, + at j).
+    """
+    poles = build_horizon_poles(
+        positions, z_list, r_ref=r_ref, r_horizon=r_horizon,
+        k_horizon=k_horizon, use_neighbor_list=use_neighbor_list,
+    )
+    n = positions.shape[0]
+    grad = grad_from_poles(poles, n)
+    if return_poles:
+        return grad, poles
     return grad
 
 
@@ -184,6 +225,37 @@ def e_tot_ca_with_bonds(
     return e
 
 
+def build_bond_poles(
+    positions: np.ndarray,
+    r_eq: float = R_CA_CA_EQ,
+    r_min: float = R_BOND_MIN,
+    r_max: float = R_BOND_MAX,
+    k_bond: float = K_BOND,
+) -> List[Tuple[int, int, np.ndarray]]:
+    """
+    Bond potential vectors (poles) for consecutive Cα–Cα. Each pole (i, j, vec)
+    has vec pointing i→j: force on i is −vec, on j is +vec.
+    """
+    n = positions.shape[0]
+    poles: List[Tuple[int, int, np.ndarray]] = []
+    for i in range(n - 1):
+        j = i + 1
+        d = positions[j] - positions[i]
+        r = np.linalg.norm(d)
+        if r < 1e-12:
+            continue
+        u = d / r
+        if r < r_min:
+            g = -2 * k_bond * (r_min - r)
+        elif r > r_max:
+            g = 2 * k_bond * (r - r_max)
+        else:
+            g = 2 * k_bond * 0.1 * (r - r_eq)
+        vec = g * u  # i→j
+        poles.append(_pole(i, j, vec))
+    return poles
+
+
 def grad_bonds_only(
     positions: np.ndarray,
     r_eq: float = R_CA_CA_EQ,
@@ -199,21 +271,8 @@ def grad_bonds_only(
     Used for fast minimization of long chains without finite differences.
     """
     n = positions.shape[0]
-    grad = np.zeros_like(positions)
-    for i in range(n - 1):
-        d = positions[i + 1] - positions[i]
-        r = np.linalg.norm(d)
-        if r < 1e-12:
-            continue
-        u = d / r
-        if r < r_min:
-            g = -2 * k_bond * (r_min - r)
-        elif r > r_max:
-            g = 2 * k_bond * (r - r_max)
-        else:
-            g = 2 * k_bond * 0.1 * (r - r_eq)
-        grad[i] -= g * u
-        grad[i + 1] += g * u
+    poles = build_bond_poles(positions, r_eq=r_eq, r_min=r_min, r_max=r_max, k_bond=k_bond)
+    grad = grad_from_poles(poles, n)
     if include_clash:
         window = min(20, n)
         for j in range(2, window + 1):

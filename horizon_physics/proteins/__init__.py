@@ -25,7 +25,14 @@ from .side_chain_placement import (
     side_chain_placement_geometry,
     AA_LIST,
 )
-from .folding_energy import e_tot, minimize_e_tot, small_peptide_energy
+from .folding_energy import (
+    e_tot,
+    minimize_e_tot,
+    small_peptide_energy,
+    build_horizon_poles,
+    build_bond_poles,
+    grad_from_poles,
+)
 from .casp_submission import hqiv_predict_structure
 from .gradient_descent_folding import (
     minimize_e_tot_lbfgs,
@@ -61,6 +68,9 @@ __all__ = [
     "e_tot",
     "minimize_e_tot",
     "small_peptide_energy",
+    "build_horizon_poles",
+    "build_bond_poles",
+    "grad_from_poles",
     "hqiv_predict_structure",
     "minimize_e_tot_lbfgs",
     "rational_alpha_parameters_folding",
