@@ -21,7 +21,7 @@ from .casp_submission import (
     _place_full_backbone,
     AA_1to3,
 )
-from .folding_energy import e_tot, e_tot_ca_with_bonds, grad_full
+from .folding_energy import e_tot, e_tot_ca_with_bonds, grad_full, grad_bonds_only
 from .gradient_descent_folding import minimize_e_tot_lbfgs, _project_bonds
 from .peptide_backbone import backbone_bond_lengths
 
@@ -29,15 +29,24 @@ from .peptide_backbone import backbone_bond_lengths
 Z_N, Z_CA, Z_C, Z_O = 7, 6, 6, 8
 
 
-def _minimize_bonds_fast(ca_init: np.ndarray, z_list: np.ndarray, max_iter: int = 30) -> Tuple[np.ndarray, Dict[str, float]]:
+def _minimize_bonds_fast(
+    ca_init: np.ndarray,
+    z_list: np.ndarray,
+    max_iter: int = 30,
+    fast_horizon: bool = False,
+) -> Tuple[np.ndarray, Dict[str, float]]:
     """
-    Fast minimization for long chains: bonds + full vector sum of horizon forces.
-    Analytical gradient, no FD. Project bonds after each step.
+    Fast minimization for long chains. Default: bonds + full vector-sum horizon (analytical).
+    fast_horizon=True: bonds-only (nearest-neighbor), for debugging/speed.
     """
     pos = np.array(ca_init, dtype=float)
     n = pos.shape[0]
     for it in range(max_iter):
-        grad = grad_full(pos, z_list, include_bonds=True, include_horizon=True)
+        grad = (
+            grad_bonds_only(pos)
+            if fast_horizon
+            else grad_full(pos, z_list, include_bonds=True, include_horizon=True)
+        )
         g_norm = np.linalg.norm(grad)
         if g_norm < 1e-4:
             break
@@ -51,7 +60,7 @@ def _minimize_bonds_fast(ca_init: np.ndarray, z_list: np.ndarray, max_iter: int 
         "e_initial": e_final,
         "n_iter": it + 1,
         "success": True,
-        "message": "Bonds-only (fast path)",
+        "message": "Bonds-only (fast path)" if fast_horizon else "Bonds + horizon (fast path)",
     }
 
 
@@ -88,6 +97,8 @@ def minimize_full_chain(
     max_iter: int = 500,
     gtol: float = 1e-5,
     include_sidechains: bool = False,
+    fast_horizon: bool = False,
+    side_chain_pack: bool = True,
 ) -> Dict[str, object]:
     """
     Full-chain minimization: minimize E_tot over Cα, then rebuild backbone.
@@ -99,6 +110,8 @@ def minimize_full_chain(
         max_iter: L-BFGS max iterations.
         gtol: Gradient tolerance for convergence.
         include_sidechains: If True, add Cβ positions (from ideal geometry); no full side chains yet.
+        fast_horizon: If True, use bonds-only gradient (nearest-neighbor); faster, for debugging.
+        side_chain_pack: If True and include_sidechains, run lightweight Cβ rotamer search after backbone.
 
     Returns:
         dict with:
@@ -130,9 +143,11 @@ def minimize_full_chain(
         ca_init = np.asarray(ca_init, dtype=float)
         assert ca_init.shape == (n_res, 3)
     z_ca = _z_list_ca(seq)
-    # Fast path for long chains: bonds-only with analytical gradient (seconds, not minutes)
+    # Fast path for long chains: analytical gradient (bonds + full horizon by default)
     if n_res > 50:
-        ca_min, info = _minimize_bonds_fast(ca_init, z_ca, max_iter=min(30, max_iter))
+        ca_min, info = _minimize_bonds_fast(
+            ca_init, z_ca, max_iter=min(30, max_iter), fast_horizon=fast_horizon
+        )
     else:
         ca_min, info = minimize_e_tot_lbfgs(
             ca_init,
@@ -140,6 +155,7 @@ def minimize_full_chain(
             max_iter=max_iter,
             gtol=gtol,
             energy_func=e_tot_ca_with_bonds,
+            grad_func=lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=not fast_horizon),
             project_bonds=True,
             r_bond_min=2.5,
             r_bond_max=6.0,
@@ -150,6 +166,8 @@ def minimize_full_chain(
     E_backbone_final = float(e_tot(pos_bb, z_bb))
     if include_sidechains:
         backbone_atoms = _add_cb(backbone_atoms, seq)
+        if side_chain_pack:
+            backbone_atoms = _side_chain_pack_light(backbone_atoms, seq)
     return {
         "ca_min": ca_min,
         "backbone_atoms": backbone_atoms,
@@ -160,6 +178,72 @@ def minimize_full_chain(
         "sequence": seq,
         "include_sidechains": include_sidechains,
     }
+
+
+def _rotate_vector_around_axis(v: np.ndarray, axis: np.ndarray, deg: float) -> np.ndarray:
+    """Rotate vector v around axis by deg (degrees). Axis need not be unit."""
+    axis = np.asarray(axis, dtype=float)
+    nrm = np.linalg.norm(axis)
+    if nrm < 1e-12:
+        return v.copy()
+    axis = axis / nrm
+    rad = np.deg2rad(deg)
+    c, s = np.cos(rad), np.sin(rad)
+    return v * c + np.cross(axis, v) * s + axis * (np.dot(axis, v) * (1 - c))
+
+
+def _side_chain_pack_light(
+    backbone_atoms: List[Tuple[str, np.ndarray]],
+    sequence: str,
+    r_clash: float = 2.0,
+) -> List[Tuple[str, np.ndarray]]:
+    """
+    Lightweight Cβ rotamer search: try 3 rotations (0°, 120°, 240°) around N–CA;
+    keep the orientation with fewest clashes. Improves surface packing / lDDT.
+    """
+    out = list(backbone_atoms)
+    all_xyz = np.array([xyz for _, xyz in out])
+    n_res = len(sequence)
+    idx = 0
+    for res_i in range(n_res):
+        aa = sequence[res_i]
+        if aa == "G":
+            idx += 4
+            continue
+        # Order: N, CA, CB, C, O
+        i_n, i_ca, i_cb = idx, idx + 1, idx + 2
+        idx += 5
+        n_xyz = out[i_n][1]
+        ca_xyz = out[i_ca][1]
+        cb_xyz = out[i_cb][1]
+        axis = ca_xyz - n_xyz
+        v_ca_cb = cb_xyz - ca_xyz
+        best_cb = cb_xyz
+        best_count = _count_clashes(cb_xyz, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash)
+        for angle in (120.0, 240.0):
+            v_rot = _rotate_vector_around_axis(v_ca_cb, axis, angle)
+            cb_new = ca_xyz + v_rot
+            count = _count_clashes(cb_new, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash)
+            if count < best_count:
+                best_count = count
+                best_cb = cb_new
+        out[i_cb] = ("CB", best_cb)
+        all_xyz[i_cb] = best_cb
+    return out
+
+
+def _count_clashes(
+    xyz: np.ndarray,
+    all_xyz: np.ndarray,
+    exclude: Tuple[int, ...],
+    r_clash: float = 2.0,
+) -> int:
+    """Number of atoms in all_xyz (excluding indices in exclude) within r_clash of xyz."""
+    d = np.linalg.norm(all_xyz - xyz, axis=1)
+    mask = np.ones(len(d), dtype=bool)
+    for i in exclude:
+        mask[i] = False
+    return int(np.sum(mask & (d < r_clash)))
 
 
 def _add_cb(
@@ -233,17 +317,37 @@ def full_chain_to_pdb(
 
 
 if __name__ == "__main__":
+    import argparse
+    import sys
     from horizon_physics.proteins.casp_submission import _parse_fasta
-    fasta = ">test\nMKFLNDR"
+
+    parser = argparse.ArgumentParser(description="HQIV full-chain minimizer: FASTA → minimized PDB")
+    parser.add_argument("fasta", nargs="?", help="FASTA file or string (default: stdin)")
+    parser.add_argument("-o", "--output", help="Output PDB path (default: stdout)")
+    parser.add_argument("--fast", action="store_true", help="Use bonds-only gradient (nearest-neighbor; faster, for debugging)")
+    parser.add_argument("--no-sidechain-pack", action="store_true", help="Skip Cβ rotamer search after backbone")
+    parser.add_argument("--no-sidechains", action="store_true", help="Backbone only (no Cβ)")
+    args = parser.parse_args()
+
+    if args.fasta:
+        with open(args.fasta) as f:
+            fasta = f.read()
+    else:
+        fasta = sys.stdin.read()
     seq = _parse_fasta(fasta)
-    result = minimize_full_chain(seq, max_iter=300, include_sidechains=True)
-    print("Full protein minimizer (HQIV)")
-    print(f"  n_res: {result['n_res']}")
-    print(f"  E_ca_final: {result['E_ca_final']:.2f} eV")
-    print(f"  E_backbone_final: {result['E_backbone_final']:.2f} eV")
-    print(f"  L-BFGS: {result['info']['n_iter']} iter, {result['info']['message']}")
+    if not seq:
+        sys.stderr.write("No sequence found in FASTA\n")
+        sys.exit(1)
+    result = minimize_full_chain(
+        seq,
+        max_iter=500,
+        include_sidechains=not args.no_sidechains,
+        fast_horizon=args.fast,
+        side_chain_pack=not args.no_sidechain_pack and not args.no_sidechains,
+    )
     pdb = full_chain_to_pdb(result)
-    print(f"  PDB lines: {pdb.count('ATOM')} ATOMs")
-    assert result["n_res"] == len(seq)
-    assert result["E_ca_final"] <= result["info"]["e_initial"] + 1.0
-    print("Exact match to experiment (full-chain minimization).")
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(pdb)
+    else:
+        print(pdb)

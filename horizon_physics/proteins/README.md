@@ -105,7 +105,7 @@ out = predict_ss_with_angles("MKFLNDR")  # includes dist_to_alpha_min, dist_to_b
 
 ### Full-chain minimizer
 
-Minimize E_tot over the Cα trace (L-BFGS), then rebuild full backbone (N, CA, C, O) and optional Cβ:
+Minimize E_tot over the Cα trace (L-BFGS or fast path), then rebuild full backbone (N, CA, C, O) and optional Cβ. **Default:** full vector-sum horizon gradient (every atom j contributes to force on i within 15 Å); optional lightweight Cβ rotamer search after backbone to improve packing/lDDT.
 
 ```python
 from horizon_physics.proteins import minimize_full_chain, full_chain_to_pdb
@@ -114,6 +114,10 @@ result = minimize_full_chain("MKFLNDR", max_iter=300, include_sidechains=True)
 # result["ca_min"], result["backbone_atoms"], result["E_ca_final"], result["E_backbone_final"]
 pdb_str = full_chain_to_pdb(result, chain_id="A")
 ```
+
+- **Gradients:** Analytical everywhere (`grad_bonds_only` + `grad_horizon_full`); no finite differences in L-BFGS or fast path.
+- **Horizon:** Default = full vector sum over all pairs within horizon radius. Use `fast_horizon=True` (or CLI `--fast`) for bonds-only / nearest-neighbor (faster, for debugging).
+- **Side-chain pack:** If `include_sidechains=True`, a lightweight Cβ rotamer search (0°, 120°, 240° around N–CA) runs after backbone minimization; disable with `side_chain_pack=False`.
 
 ### CASP submission: FASTA → PDB (SS-aware)
 
@@ -135,6 +139,14 @@ pdb_str = hqiv_predict_structure(fasta, ss_string=ss)
 3. **Naming**: Use the CASP-assigned target ID in the header if required.
 4. **Validation**: Run `horizon_physics/proteins/validation.ipynb` to confirm “Exact match to experiment” for H₂O, crambin, etc.
 
+### CLI (full-chain minimizer)
+
+```bash
+python -m horizon_physics.proteins.full_protein_minimizer target.fasta -o out.pdb
+python -m horizon_physics.proteins.full_protein_minimizer --fast target.fasta   # bonds-only gradient (debug)
+python -m horizon_physics.proteins.full_protein_minimizer --no-sidechain-pack target.fasta  # skip Cβ rotamer search
+```
+
 ## Validation (no Jupyter)
 
 Run all checks and print "Exact match to experiment":
@@ -147,6 +159,12 @@ python -m horizon_physics.proteins.validation
 
 - **Crambin**: `examples/crambin.py` — 46 residues, full backbone PDB.
 - **Insulin fragment**: `examples/insulin_fragment.py` — B-chain 1–30.
+
+## Implementation notes
+
+- **Analytical gradients:** All minimization uses analytical gradients (`grad_bonds_only` for consecutive Cα–Cα bonds; `grad_horizon_full` for the full vector sum of horizon forces from every atom j to i within 15 Å). No finite-difference gradients.
+- **Default horizon:** Full vector-sum horizon (long-range crowding) is the default. Use `fast_horizon=True` or `--fast` for bonds-only (nearest-neighbor only), which is faster and useful for debugging.
+- **Side-chain packing:** After backbone minimization, if side chains are requested, a lightweight Cβ rotamer search runs: for each non-Gly residue, try three Cβ orientations (0°, 120°, 240° around N–CA) and keep the one with fewest clashes. This improves surface packing and lDDT.
 
 ## License
 

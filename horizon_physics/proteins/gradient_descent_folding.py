@@ -23,6 +23,7 @@ from .peptide_backbone import rational_ramachandran_alpha as _rational_ramachand
 from . import alpha_helix as _alpha_helix
 
 EnergyFunc = Callable[[np.ndarray, np.ndarray], float]
+GradFunc = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 
 def _gradient_finite_difference(
@@ -113,6 +114,7 @@ def minimize_e_tot_lbfgs(
     gtol: float = 1e-6,
     eps: float = 1e-7,
     energy_func: Optional[EnergyFunc] = None,
+    grad_func: Optional[GradFunc] = None,
     project_bonds: bool = False,
     r_bond_min: float = 2.5,
     r_bond_max: float = 6.0,
@@ -120,6 +122,7 @@ def minimize_e_tot_lbfgs(
     """
     Minimize E using L-BFGS (deterministic). No random seed; same initial
     point always yields same result. If energy_func is None, use e_tot.
+    If grad_func is provided, use analytical gradient (no finite differences).
     If project_bonds=True, after each step project so consecutive Cα are in [r_min, r_max].
 
     Returns:
@@ -130,7 +133,14 @@ def minimize_e_tot_lbfgs(
     x = np.array(positions_init, dtype=float).ravel()
     n = len(z_list)
     e0 = ef(x.reshape(n, 3), z_list)
-    grad = _gradient_finite_difference(x, z_list, eps, energy_func=ef)
+
+    def _grad(x_flat: np.ndarray) -> np.ndarray:
+        pos = x_flat.reshape(n, 3)
+        if grad_func is not None:
+            return grad_func(pos, z_list).ravel()
+        return _gradient_finite_difference(x_flat, z_list, eps, energy_func=ef)
+
+    grad = _grad(x)
     s_list: list[np.ndarray] = []
     y_list: list[np.ndarray] = []
     for it in range(max_iter):
@@ -160,7 +170,7 @@ def minimize_e_tot_lbfgs(
             step *= 0.5
         x_prev = x.copy()
         x = x_new
-        grad_new = _gradient_finite_difference(x, z_list, eps, energy_func=ef)
+        grad_new = _grad(x)
         s_list.append(x - x_prev)
         y_list.append(grad_new - grad)
         grad = grad_new
