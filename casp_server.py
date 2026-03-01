@@ -24,7 +24,7 @@ if __name__ != "__main__":
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-from horizon_physics.proteins import hqiv_predict_structure
+from horizon_physics.proteins import hqiv_predict_structure, hqiv_predict_structure_assembly
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB max FASTA
@@ -88,23 +88,38 @@ def health():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Accept FASTA in body, JSON, or form (sequence= / fasta= / title= / email= / inchi=). Return CASP-format PDB. Ligand targets: InChI accepted and ignored — we return protein-only (CAMEO allows this). If email param is set and SMTP configured, also sends PDB to that address."""
-    fasta = None
+    """Accept FASTA in body, JSON, or form (sequence= / fasta= / title= / email= / inchi=). Multi-chain: form/JSON can send multiple sequence values; returns one PDB with chain A,B,C,.... If email set and SMTP configured, also sends PDB to that address."""
+    sequences = None
     if request.is_json:
         data = request.get_json(silent=True) or {}
-        fasta = data.get("fasta") or data.get("sequence")
-    if fasta is None and request.form:
-        # CAMEO: sequence, fasta, title, email, inchi (ligand); we use sequence/fasta only, return protein-only
-        fasta = request.form.get("sequence") or request.form.get("fasta")
-    if fasta is None:
-        fasta = request.get_data(as_text=True)
-    if not fasta or not fasta.strip():
-        return Response("Missing FASTA in body, JSON 'fasta'/'sequence', or form 'sequence'/'fasta'\n", status=400, mimetype="text/plain")
+        seq = data.get("fasta") or data.get("sequence")
+        if isinstance(seq, list):
+            sequences = [s.strip() for s in seq if s and str(s).strip()]
+        elif seq:
+            sequences = [str(seq).strip()]
+    if sequences is None and request.form:
+        # CAMEO: sequence can be repeated for assembly (sequence=...&sequence=...)
+        sequences = request.form.getlist("sequence") or request.form.getlist("fasta")
+        if not sequences:
+            single = request.form.get("sequence") or request.form.get("fasta")
+            if single:
+                sequences = [single.strip()]
+        else:
+            sequences = [s.strip() for s in sequences if s and s.strip()]
+    if sequences is None:
+        raw = request.get_data(as_text=True)
+        if raw and raw.strip():
+            sequences = [raw.strip()]
+    if not sequences:
+        return Response("Missing FASTA/sequence in body, JSON, or form 'sequence'/'fasta'\n", status=400, mimetype="text/plain")
 
     to_email, job_title = _get_email_and_title()
 
     try:
-        pdb = hqiv_predict_structure(fasta.strip())
+        if len(sequences) == 1:
+            pdb = hqiv_predict_structure(sequences[0])
+        else:
+            pdb = hqiv_predict_structure_assembly(sequences)
         if to_email:
             _send_pdb_email(to_email, pdb, job_title)
         return Response(pdb, status=200, mimetype="text/plain")

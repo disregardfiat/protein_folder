@@ -220,6 +220,45 @@ def hqiv_predict_structure(
     return "\n".join(lines)
 
 
+def hqiv_predict_structure_assembly(
+    sequences: List[str],
+    ss_strings: Optional[List[Optional[str]]] = None,
+) -> str:
+    """
+    Multiple sequences (assembly/complex) → one PDB (MODEL 1) with chain A, B, C, ...
+    Each item in sequences can be FASTA or raw sequence. ss_strings[i] optional per chain.
+    """
+    if not sequences:
+        return "MODEL     1\nEND\n"
+    if ss_strings is None:
+        ss_strings = [None] * len(sequences)
+    while len(ss_strings) < len(sequences):
+        ss_strings.append(None)
+    lines = ["MODEL     1"]
+    atom_id = 1
+    chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for i, fasta_or_seq in enumerate(sequences):
+        seq = _parse_fasta(fasta_or_seq) if isinstance(fasta_or_seq, str) else ""
+        if not seq:
+            continue
+        chain_id = chain_ids[i] if i < len(chain_ids) else "A"
+        ss = ss_strings[i] if i < len(ss_strings) else None
+        ca_pos = _place_backbone_ca(seq, ss_string=ss)
+        atoms = _place_full_backbone(ca_pos, seq)
+        n_res = len(seq)
+        atoms_per_res = 4
+        for res_id in range(1, n_res + 1):
+            res_1 = seq[res_id - 1]
+            res_3 = AA_1to3.get(res_1, "UNK")
+            for a in range(atoms_per_res):
+                name, xyz = atoms[(res_id - 1) * atoms_per_res + a]
+                lines.append(_pdb_line(name, res_3, res_id, float(xyz[0]), float(xyz[1]), float(xyz[2]), atom_id, chain_id))
+                atom_id += 1
+    lines.append("ENDMDL")
+    lines.append("END")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     fasta = ">test\nMKFL"
     pdb = hqiv_predict_structure(fasta)

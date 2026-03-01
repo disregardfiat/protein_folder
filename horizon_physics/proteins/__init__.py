@@ -33,7 +33,7 @@ from .folding_energy import (
     build_bond_poles,
     grad_from_poles,
 )
-from .casp_submission import hqiv_predict_structure
+from .casp_submission import hqiv_predict_structure, hqiv_predict_structure_assembly
 from .gradient_descent_folding import (
     minimize_e_tot_lbfgs,
     rational_alpha_parameters as rational_alpha_parameters_folding,
@@ -87,6 +87,7 @@ __all__ = [
     "build_bond_poles",
     "grad_from_poles",
     "hqiv_predict_structure",
+    "hqiv_predict_structure_assembly",
     "minimize_e_tot_lbfgs",
     "rational_alpha_parameters_folding",
     "predict_ss",

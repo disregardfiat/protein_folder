@@ -20,8 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual envs
+# Virtual envs and server config (real SMTP etc.)
 .env
+.env.casp
 .venv
 env/
 venv/
