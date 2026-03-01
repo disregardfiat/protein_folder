@@ -4,15 +4,18 @@ POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
 Uses minimize_full_chain_hierarchical with cone funnel (stages 1–2) then Cartesian refinement (stage 3).
 If "email" param is set and SMTP is configured, also sends PDB by email.
 GET /health → 200 OK.
-Env: SMTP_* for email; SMTP_CC_TO (or cc_to) to CC results to an address when it is not the recipient; FUNNEL_RADIUS (default 10), USE_FAST_PREDICT=1 to skip HKE.
+Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results) for pending/ and outputs/; USE_FAST_PREDICT=1 to skip HKE.
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
 
 from __future__ import annotations
 
 import os
+import random
 import re
+import shutil
 import sys
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid, formatdate
@@ -50,6 +53,52 @@ HKE_MAX_ITER = (
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB max FASTA
+
+# Result persistence: pending/ (request .txt, then .pdb when done) → on success move both to outputs/
+_output_base = os.environ.get("CASP_OUTPUT_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "casp_results")
+PENDING_DIR = os.path.join(_output_base, "pending")
+OUTPUTS_DIR = os.path.join(_output_base, "outputs")
+
+
+def _ensure_output_dirs() -> None:
+    os.makedirs(PENDING_DIR, exist_ok=True)
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+
+def _job_id() -> str:
+    return f"{int(time.time())}_{random.randint(1000, 9999)}"
+
+
+def _write_pending_txt(job_id: str, job_title: str | None, to_email: str | None, num_sequences: int, seq_lengths: list[int]) -> None:
+    """Write pending/{job_id}.txt with POST summary (instructions / request info)."""
+    _ensure_output_dirs()
+    path = os.path.join(PENDING_DIR, f"{job_id}.txt")
+    lines = [
+        f"title={job_title or ''}",
+        f"email={to_email or ''}",
+        f"num_sequences={num_sequences}",
+        f"lengths={seq_lengths}",
+        f"received_utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "",
+        "POST /predict with sequence= (or multiple for assembly), title=, email=.",
+        "When prediction completes, this file and the .pdb are moved to outputs/.",
+    ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def _move_to_outputs(job_id: str, pdb_content: str) -> None:
+    """Write pending/{job_id}.pdb then move both .txt and .pdb to outputs/."""
+    _ensure_output_dirs()
+    pdb_path = os.path.join(PENDING_DIR, f"{job_id}.pdb")
+    txt_path = os.path.join(PENDING_DIR, f"{job_id}.txt")
+    with open(pdb_path, "w") as f:
+        f.write(pdb_content)
+    for name in (f"{job_id}.txt", f"{job_id}.pdb"):
+        src = os.path.join(PENDING_DIR, name)
+        dst = os.path.join(OUTPUTS_DIR, name)
+        if os.path.isfile(src):
+            shutil.move(src, dst)
 
 # Optional SMTP: send PDB to request's "email" address when set
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -251,6 +300,8 @@ def predict():
         return Response("No valid sequence found.\n", status=400, mimetype="text/plain")
 
     to_email, job_title = _get_email_and_title()
+    job_id = _job_id()
+    _write_pending_txt(job_id, job_title, to_email, len(seqs), [len(s) for s in seqs])
 
     try:
         if USE_FAST_PREDICT and hqiv_predict_structure is not None:
@@ -264,6 +315,7 @@ def predict():
                 pdb = _predict_hke_single(seqs[0])
             else:
                 pdb = _predict_hke_assembly(seqs)
+        _move_to_outputs(job_id, pdb)
         if to_email:
             _send_pdb_email(to_email, pdb, job_title)
         return Response(pdb, status=200, mimetype="text/plain")

@@ -24,6 +24,9 @@ wheels/
 .env
 .env.casp
 .venv
+
+# CASP server result persistence (pending/ and outputs/)
+casp_results/
 env/
 venv/
 
