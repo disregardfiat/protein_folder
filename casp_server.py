@@ -10,11 +10,13 @@ Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
 import shutil
 import sys
+import threading
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -69,11 +71,15 @@ def _job_id() -> str:
     return f"{int(time.time())}_{random.randint(1000, 9999)}"
 
 
-def _write_pending_txt(job_id: str, job_title: str | None, to_email: str | None, num_sequences: int, seq_lengths: list[int]) -> None:
-    """Write pending/{job_id}.txt with POST summary (instructions / request info)."""
+MAX_ATTEMPTS = 2  # After this many attempts (initial + retries on restart), send failure email instead of retrying
+
+
+def _write_pending_txt(job_id: str, job_title: str | None, to_email: str | None, num_sequences: int, seq_lengths: list[int], attempts: int = 1) -> None:
+    """Write pending/{job_id}.txt with POST summary and attempts count."""
     _ensure_output_dirs()
     path = os.path.join(PENDING_DIR, f"{job_id}.txt")
     lines = [
+        f"attempts={attempts}",
         f"title={job_title or ''}",
         f"email={to_email or ''}",
         f"num_sequences={num_sequences}",
@@ -81,20 +87,27 @@ def _write_pending_txt(job_id: str, job_title: str | None, to_email: str | None,
         f"received_utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
         "",
         "POST /predict with sequence= (or multiple for assembly), title=, email=.",
-        "When prediction completes, this file and the .pdb are moved to outputs/.",
+        "When prediction completes, this file, .request.json, and .pdb are moved to outputs/.",
     ]
     with open(path, "w") as f:
         f.write("\n".join(lines))
 
 
+def _write_pending_request(job_id: str, sequences: list[str], job_title: str | None, to_email: str | None) -> None:
+    """Write pending/{job_id}.request.json so the job can be retried on restart."""
+    _ensure_output_dirs()
+    path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
+    with open(path, "w") as f:
+        json.dump({"sequences": sequences, "title": job_title, "email": to_email}, f)
+
+
 def _move_to_outputs(job_id: str, pdb_content: str) -> None:
-    """Write pending/{job_id}.pdb then move both .txt and .pdb to outputs/."""
+    """Write pending/{job_id}.pdb then move .txt, .pdb, and .request.json to outputs/."""
     _ensure_output_dirs()
     pdb_path = os.path.join(PENDING_DIR, f"{job_id}.pdb")
-    txt_path = os.path.join(PENDING_DIR, f"{job_id}.txt")
     with open(pdb_path, "w") as f:
         f.write(pdb_content)
-    for name in (f"{job_id}.txt", f"{job_id}.pdb"):
+    for name in (f"{job_id}.txt", f"{job_id}.pdb", f"{job_id}.request.json"):
         src = os.path.join(PENDING_DIR, name)
         dst = os.path.join(OUTPUTS_DIR, name)
         if os.path.isfile(src):
@@ -185,6 +198,138 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
             smtp.sendmail(from_addr, recipients, msg.as_string())
     except Exception as e:
         app.logger.warning("SMTP send failed: %s", e)
+
+
+def _send_failure_email(to_email: str, job_id: str, job_title: str | None) -> None:
+    """Notify that the job failed after max attempts (no third try)."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        return
+    subject = f"HQIV prediction failed (job {job_id})"
+    body = f"Job {job_id} (title={job_title or 'n/a'}) did not complete after {MAX_ATTEMPTS} attempts. No further retries will be made."
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    from_addr = _smtp_from_address()
+    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
+    msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        if cc_addr != to_email.strip().lower():
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
+    msg.attach(MIMEText(body, "plain"))
+    try:
+        import smtplib
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+    except Exception as e:
+        app.logger.warning("SMTP failure-email send failed: %s", e)
+
+
+def _read_pending_attempts(txt_path: str) -> int:
+    """Parse attempts=N from first lines of pending .txt; default 1."""
+    try:
+        with open(txt_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("attempts="):
+                    return max(1, int(line.split("=", 1)[1].strip() or "1"))
+    except Exception:
+        pass
+    return 1
+
+
+def _update_pending_attempts(txt_path: str, attempts: int) -> None:
+    """Set attempts=N in the .txt file (rewrite first line)."""
+    with open(txt_path) as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("attempts="):
+            lines[i] = f"attempts={attempts}\n"
+            break
+    else:
+        lines.insert(0, f"attempts={attempts}\n")
+    with open(txt_path, "w") as f:
+        f.writelines(lines)
+
+
+def process_pending_jobs() -> None:
+    """Run once on startup: for each pending job without .pdb, retry once or send failure email after MAX_ATTEMPTS."""
+    _ensure_output_dirs()
+    if not os.path.isdir(PENDING_DIR):
+        return
+    for name in os.listdir(PENDING_DIR):
+        if not name.endswith(".txt") or name.endswith(".failed.txt"):
+            continue
+        job_id = name[:-4]
+        txt_path = os.path.join(PENDING_DIR, f"{job_id}.txt")
+        req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
+        pdb_path = os.path.join(PENDING_DIR, f"{job_id}.pdb")
+        if os.path.isfile(pdb_path):
+            continue
+        if not os.path.isfile(req_path):
+            # Legacy: .txt only (no .request.json) — can't retry; send failure if email in .txt
+            try:
+                with open(txt_path) as f:
+                    for line in f:
+                        if line.strip().startswith("email="):
+                            to_email = line.split("=", 1)[1].strip()
+                            if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+                                _send_failure_email(to_email, job_id, None)
+                            break
+            except Exception:
+                pass
+            try:
+                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{job_id}.failed.txt"))
+            except Exception:
+                pass
+            continue
+        attempts = _read_pending_attempts(txt_path)
+        if attempts >= MAX_ATTEMPTS:
+            try:
+                with open(req_path) as f:
+                    req = json.load(f)
+                to_email = (req.get("email") or "").strip()
+                if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+                    _send_failure_email(to_email, job_id, req.get("title"))
+            except Exception as e:
+                app.logger.warning("Pending job %s failure-email error: %s", job_id, e)
+            try:
+                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{job_id}.failed.txt"))
+            except Exception:
+                pass
+            try:
+                os.remove(req_path)
+            except Exception:
+                pass
+            continue
+        _update_pending_attempts(txt_path, attempts + 1)
+        try:
+            with open(req_path) as f:
+                req = json.load(f)
+        except Exception:
+            continue
+        sequences = req.get("sequences") or []
+        seqs = [_sequence_from_input(s) for s in sequences if s]
+        if not seqs:
+            continue
+        to_email = (req.get("email") or "").strip()
+        job_title = req.get("title")
+        try:
+            if USE_FAST_PREDICT and hqiv_predict_structure is not None:
+                pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
+            else:
+                pdb = _predict_hke_assembly(seqs) if len(seqs) > 1 else _predict_hke_single(seqs[0])
+            _move_to_outputs(job_id, pdb)
+            if to_email:
+                _send_pdb_email(to_email, pdb, job_title)
+        except Exception as e:
+            app.logger.warning("Pending job %s retry failed: %s", job_id, e)
 
 
 def _sequence_from_input(raw: str) -> str:
@@ -302,6 +447,7 @@ def predict():
     to_email, job_title = _get_email_and_title()
     job_id = _job_id()
     _write_pending_txt(job_id, job_title, to_email, len(seqs), [len(s) for s in seqs])
+    _write_pending_request(job_id, sequences, job_title, to_email)
 
     try:
         if USE_FAST_PREDICT and hqiv_predict_structure is not None:
@@ -366,6 +512,15 @@ def index():
   POST / or /predict with sequence(s); GET /help for API details.
 """
     return Response(body, status=200, mimetype="text/plain")
+
+
+# On startup, run pending jobs once in background (retry or send failure email after MAX_ATTEMPTS)
+def _start_pending_processor() -> None:
+    t = threading.Thread(target=process_pending_jobs, daemon=True)
+    t.start()
+
+
+_start_pending_processor()
 
 
 if __name__ == "__main__":

@@ -16,7 +16,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$ROOT
-ExecStart=$ROOT/.venv/bin/gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
+# 259200s = 72h (CASP submission window)
+ExecStart=$ROOT/.venv/bin/gunicorn -w 1 -b 127.0.0.1:8050 --timeout 259200 casp_server:app
 Restart=always
 RestartSec=5
 
