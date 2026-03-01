@@ -57,22 +57,26 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_RAW = os.environ.get("SMTP_FROM") or (SMTP_USER if SMTP_USER else "")
+SMTP_FROM_DOMAIN = (os.environ.get("SMTP_FROM_DOMAIN") or "").strip()  # e.g. disregardfiat.tech — use for From when Gmail rejects SMTP host–derived domain
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").strip().lower() in ("1", "true", "yes")
 
 
 def _smtp_from_address() -> str:
-    """Return RFC 5322–compliant From address (user@domain). Gmail rejects bare local parts. Domain is SMTP_HOST with leading 'mail.' (or first label) removed."""
+    """Return RFC 5322–compliant From address (user@domain). Gmail rejects some domains; set SMTP_FROM or SMTP_FROM_DOMAIN to use a compliant address."""
     addr = (SMTP_FROM_RAW or "").strip()
     if re.match(r"^[^@]+@[^@]+\.[^@]+", addr):
         return addr
     if SMTP_USER and "@" in SMTP_USER:
         return SMTP_USER
-    # Use domain without mail. prefix: mail.comodomodo.com.py -> comodomodo.com.py
-    domain = (SMTP_HOST or "").strip()
-    if domain.startswith("mail."):
-        domain = domain[5:]
-    elif "." in domain:
-        domain = domain.split(".", 1)[1]  # drop first label
+    # Prefer explicit domain (Gmail-friendly, e.g. disregardfiat.tech)
+    domain = SMTP_FROM_DOMAIN
+    if not domain and SMTP_HOST:
+        # Derive from SMTP host: mail.comodomodo.com.py -> comodomodo.com.py
+        domain = (SMTP_HOST or "").strip()
+        if domain.startswith("mail."):
+            domain = domain[5:]
+        elif "." in domain:
+            domain = domain.split(".", 1)[1]
     if SMTP_USER and domain:
         return f"{SMTP_USER}@{domain}"
     if domain:
