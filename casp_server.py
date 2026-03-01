@@ -4,7 +4,7 @@ POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
 Uses minimize_full_chain_hierarchical with cone funnel (stages 1–2) then Cartesian refinement (stage 3).
 If "email" param is set and SMTP is configured, also sends PDB by email.
 GET /health → 200 OK.
-Env: SMTP_* for email; FUNNEL_RADIUS (default 10), FUNNEL_RADIUS_EXIT (default 20), USE_FAST_PREDICT=1 to skip HKE (geometric-only).
+Env: SMTP_* for email; SMTP_CC_TO (or cc_to) to CC results to an address when it is not the recipient; FUNNEL_RADIUS (default 10), USE_FAST_PREDICT=1 to skip HKE.
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
 
@@ -58,6 +58,7 @@ SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_RAW = os.environ.get("SMTP_FROM") or (SMTP_USER if SMTP_USER else "")
 SMTP_FROM_DOMAIN = (os.environ.get("SMTP_FROM_DOMAIN") or "").strip()  # e.g. disregardfiat.tech — use for From when Gmail rejects SMTP host–derived domain
+SMTP_CC_TO = (os.environ.get("SMTP_CC_TO") or os.environ.get("cc_to") or "").strip()  # CC this address on result emails when not the recipient (e.g. to monitor CAMEO)
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").strip().lower() in ("1", "true", "yes")
 
 
@@ -113,6 +114,13 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
     from_addr = _smtp_from_address()
     msg["From"] = formataddr(("HQIV CASP Server", from_addr))
     msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        to_addr_lower = to_email.strip().lower()
+        if cc_addr != to_addr_lower:
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
     msg.attach(MIMEText("PDB model attached (CASP format).", "plain"))
@@ -125,7 +133,7 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
             if SMTP_USE_TLS:
                 smtp.starttls()
             smtp.login(SMTP_USER, SMTP_PASSWORD)
-            smtp.sendmail(from_addr, [to_email], msg.as_string())
+            smtp.sendmail(from_addr, recipients, msg.as_string())
     except Exception as e:
         app.logger.warning("SMTP send failed: %s", e)
 
