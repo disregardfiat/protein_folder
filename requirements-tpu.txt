@@ -1,0 +1,16 @@
+# JAX for TPU (and CPU/GPU)
+#
+# Option A — On a Google Cloud TPU VM (recommended for TPU):
+#   pip install -r requirements.txt
+#   pip install "jax[tpu]"
+# Or with libtpu index if needed:
+#   pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+#
+# Option B — Local / CPU (JAX works; TPU only when run on a TPU VM with libtpu):
+#   pip install -r requirements.txt
+#   pip install jax jaxlib
+#
+# Then on a TPU VM, install libtpu so JAX can see TPU devices:
+#   pip install libtpu -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+jax>=0.9
+jaxlib>=0.9

@@ -1,0 +1,9 @@
+# Optional: grading module (trajectory + gold → metrics for AI/ML)
+# Install with: pip install -r requirements-grading.txt
+# Enables DataFrame and CSV export for ML pipelines.
+#
+# Core grading works with base PROtein deps only; this file adds optional deps.
+
+pandas>=1.3
+# Future: lDDT / TM-score (uncomment when needed)
+# biopython>=1.79

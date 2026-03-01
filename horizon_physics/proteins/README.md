@@ -12,7 +12,7 @@ First-principles protein structure and folding from the **Horizon-centric Quantu
 
 ## Installation
 
-No external dependencies beyond **Python 3.10+** and **numpy**. Clone the repo and use:
+No external dependencies beyond **Python 3.10+** and **numpy**. Optional: **pyhqiv** for metric math (φ = 2/Θ, γ); when installed, horizon and damping use it. Clone the repo and use:
 
 ```python
 from horizon_physics.proteins import (
@@ -118,6 +118,8 @@ pdb_str = full_chain_to_pdb(result, chain_id="A")
 - **Gradients:** Analytical everywhere (`grad_bonds_only` + `grad_horizon_full`); no finite differences in L-BFGS or fast path.
 - **Horizon:** Default = full vector sum over all pairs within horizon radius. Use `fast_horizon=True` (or CLI `--fast`) for bonds-only / nearest-neighbor (faster, for debugging).
 - **Side-chain pack:** If `include_sidechains=True`, rotamer packing runs after backbone: χ1 from `side_chain_chi_preferences()` (grid pref±120°, ±60°, 0°) then 5 L-BFGS steps on χ1 to minimize clash energy. Disable with `side_chain_pack=False`. Optional standalone: `pack_sidechains(result)`.
+- **Quick mode:** `minimize_full_chain(..., quick=True)` disables side chains, uses fewer iterations and relaxed gtol, and bonds-only gradient for rapid prototyping.
+- **Long-chain collapse:** For n_res > 50, `collapse=True` (default) runs two-stage annealing (Rg collapse then refine). Tune with `long_chain_max_iter` (default 250), `collapse_init_steps` (default 40), or `k_rg_collapse` to strengthen the Rg pull. Set `collapse=False` to skip and use the original single-stage path.
 
 ### Current algorithm (full-chain pipeline)
 
@@ -137,7 +139,7 @@ The pipeline used by `minimize_full_chain` is:
    - **Horizon:** Full vector sum of repulsive forces from every atom j to i within horizon radius (12–15 Å). Each pair contributes a **bond potential vector (pole)** (i→j); gradient from `build_horizon_poles` or `grad_horizon_full`. A **neighbor list** (12 Å) limits pairs to nearby atoms for speed.
    - **Combined gradient:** Analytical only (`grad_bonds_only` + `grad_horizon_full`); no finite differences. Optional `fast_horizon`: use bonds-only (nearest-neighbor) for debugging.
    - **Step:** Gradient descent with adaptive step; after each step, **project** consecutive bonds into [2.5, 6.0] Å.
-   - **Paths:** For n_res > 50, a fast path (bonds + horizon, ~30 iter) is used; for shorter chains, L-BFGS with the same analytical gradient and bond projection.
+   - **Paths:** For n_res > 50, a **two-stage** path is used by default (`collapse=True`): (1) **Collapse:** bonds-only + radius-of-gyration (Rg) term and loose bond limits (r_max=8 Å, r_min=2 Å) for the first 50% of iterations to bias the chain toward a compact globule; (2) **Refine:** full bonds + horizon, standard [2.5, 6] Å. Optional `collapse_init_steps` (default 40) of Rg-only steps for compact init. Use `collapse=False` for the original single-stage fast path. For short chains (n_res ≤ 50), L-BFGS with analytical gradient and bond projection.
 
 5. **Backbone rebuild** — From minimized Cα, place N, CA, C, O per residue using local tangent and HQIV bond lengths (N–CA, CA–C, C–O).
 
@@ -187,6 +189,37 @@ python -m horizon_physics.proteins.validation
 
 - **Crambin**: `examples/crambin.py` — 46 residues, full backbone PDB.
 - **Insulin fragment**: `examples/insulin_fragment.py` — B-chain 1–30.
+- **T1131** (Hormaphis cornu): `examples/T1131.py` — 173 residues; writes `T1131_hormaphis_cornu_minimized_cartesian.pdb` (flat pipeline).
+- **T1037** (S0A2C3d4): `examples/T1037.py` — 404 residues, CASP14 target; writes `T1037_S0A2C3d4_minimized_cartesian.pdb` (flat pipeline).
+- **Hierarchical**: `examples/run_examples_tpu.py` — same targets via HKE; writes `*_minimized_hierarchical.pdb` and compares to the cartesian outputs.
+- **All four, both pipelines**: `python -m horizon_physics.proteins.examples.run_all_pipelines` — runs T1037, T1131, crambin, insulin fragment with Cartesian and Hierarchical; writes `*_minimized_cartesian.pdb` and `*_minimized_hierarchical.pdb`. Use `--quick` for fewer iters, `--targets crambin,insulin_fragment` for a subset.
+
+Run from repo root: `python3 -m horizon_physics.proteins.examples.T1131` or `T1037`.
+
+### Reference structures (T1131, T1037)
+
+Example outputs: run `T1131.py` / `T1037.py` for `*_minimized_cartesian.pdb`; run `run_examples_tpu.py` for `*_minimized_hierarchical.pdb` (same targets, comparable). To evaluate against published reference structures:
+
+- **CASP targets:** Check [CASP](https://predictioncenter.org) for the corresponding target IDs and released experimental or reference models when available.
+- **Grading (Cα-RMSD):** Use the bundled grading module to compare a predicted PDB to a reference (e.g. from RCSB or CASP):
+  ```python
+  from horizon_physics.proteins import ca_rmsd
+  rmsd_ang, per_res, pred_ca, ref_ca = ca_rmsd("crambin_minimized_cartesian.pdb", "1crn.pdb")
+  print("Cα-RMSD: {:.3f} Å".format(rmsd_ang))
+  ```
+  CLI: `python -m horizon_physics.proteins.grade_folds pred.pdb ref.pdb` (optionally `--no-resid` to align by residue order instead of residue ID).
+
+- **Optional grading module (trajectory + gold for AI/ML):** Install with `pip install -r requirements-grading.txt` (adds pandas). Then use translation logs and gold PDBs to get per-frame metrics for better modeling and algorithms:
+  ```python
+  from horizon_physics.proteins.grading import grade_trajectory, grade_prediction
+  # Per-frame Cα-RMSD over a trajectory (Cartesian or HKE 6-DOF JSONL)
+  results = grade_trajectory("traj_logs/crambin_cartesian_traj.jsonl", "gold/1crn.pdb", output_path="grades.csv")
+  # Single prediction vs gold
+  metrics = grade_prediction("crambin_minimized_cartesian.pdb", "gold/1crn.pdb")
+  ```
+  See **[horizon_physics/proteins/grading/README.md](grading/README.md)** for the full ML pipeline (trajectory log → gold → CSV/JSON for reward signals, convergence curves, or training data).
+
+No reference PDBs are bundled; download a reference (e.g. 1CRN for crambin from RCSB), then use `ca_rmsd` or the grading module to get Cα-RMSD after Kabsch superposition.
 
 ### Bond potential vectors (poles)
 
@@ -204,6 +237,10 @@ grad = grad_from_poles(poles_b + poles_h, n)
 ```
 
 `grad_horizon_full(..., return_poles=True)` returns `(grad, poles)` so you can keep the horizon poles for the current step.
+
+## pyhqiv integration
+
+When **pyhqiv** is installed, `_hqiv_base` uses `phi_from_theta_local` (φ = 2/Θ) and `GAMMA` from pyhqiv. For a list of suggested additions to pyhqiv so PROtein can rely on it for all HQIV metric math (Θ from Z/coordination, bond length from Θ, damping magnitude, constants), see **[docs/pyhqiv_recommendations.md](../../docs/pyhqiv_recommendations.md)**.
 
 ## Implementation notes
 

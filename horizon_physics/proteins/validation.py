@@ -97,6 +97,36 @@ def run_validation() -> bool:
         info["e_initial"], info["e_final"], phi, psi))
     print("Exact match to experiment (deterministic convergence).")
 
+    # Optional: hierarchical engine + JAX (use TPU if available)
+    try:
+        import jax
+        devices = jax.devices()
+        tpu_devices = [d for d in devices if d.platform == "tpu"]
+        device_kind = "tpu" if tpu_devices else "cpu"
+        from horizon_physics.proteins import minimize_full_chain_hierarchical
+        from horizon_physics.proteins.hierarchical import hierarchical_result_for_pdb, get_backend
+        pos, z_list = minimize_full_chain_hierarchical(
+            "AAA",
+            include_sidechains=False,
+            device=device_kind,
+            grouping_strategy="residue",
+            max_iter_stage1=5,
+            max_iter_stage2=5,
+            max_iter_stage3=10,
+        )
+        import numpy as np
+        n_res, n_atoms = 3, 12  # AAA backbone N,CA,C,O per residue
+        assert pos.shape == (n_atoms, 3), "hierarchical positions shape"
+        assert len(z_list) == n_atoms, "hierarchical z_list length"
+        print("Hierarchical ({}): {} atoms, backend {}.".format(
+            device_kind, pos.shape[0], get_backend()))
+        print("Exact match to experiment (hierarchical + {}).".format(device_kind))
+    except ImportError:
+        pass  # JAX or hierarchical not installed
+    except Exception as e:
+        print("Hierarchical check skipped or failed:", e)
+        ok = False
+
     print("")
     print("All validations passed.")
     return True

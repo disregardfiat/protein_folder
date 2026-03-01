@@ -1,0 +1,6 @@
+# PROtein — base (Python 3.10+)
+numpy>=1.22
+scipy>=1.9
+
+# Optional: pyhqiv — use for metric math (φ = 2/Θ, γ in horizon/damping)
+# pip install pyhqiv  → horizon_scalar and damping_force_magnitude use pyhqiv

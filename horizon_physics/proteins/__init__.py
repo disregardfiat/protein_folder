@@ -45,6 +45,21 @@ from .secondary_structure_predictor import (
     preferred_basin_phi_psi,
 )
 from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb, pack_sidechains
+from .grade_folds import ca_rmsd, load_ca_from_pdb, kabsch_superpose
+
+# Optional hierarchical kinematic engine (parallel path)
+try:
+    from .hierarchical import minimize_full_chain_hierarchical
+except ImportError:
+    minimize_full_chain_hierarchical = None  # type: ignore[misc, assignment]
+
+# Optional grading (trajectory + gold → metrics for AI/ML; see grading/README.md)
+try:
+    from .grading import grade_trajectory, load_trajectory_frames, grade_prediction
+except ImportError:
+    grade_trajectory = None  # type: ignore[misc, assignment]
+    load_trajectory_frames = None  # type: ignore[misc, assignment]
+    grade_prediction = None  # type: ignore[misc, assignment]
 
 __all__ = [
     "hqiv_alpha_helix",
@@ -81,4 +96,11 @@ __all__ = [
     "minimize_full_chain",
     "full_chain_to_pdb",
     "pack_sidechains",
+    "ca_rmsd",
+    "load_ca_from_pdb",
+    "kabsch_superpose",
+    "minimize_full_chain_hierarchical",
+    "grade_trajectory",
+    "load_trajectory_frames",
+    "grade_prediction",
 ]

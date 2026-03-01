@@ -4,12 +4,10 @@ Deterministic gradient-descent folding within HQIV.
 Pure first principles: E_tot = Σ ħc/Θ_i + U_φ (geometric damping). No Monte Carlo,
 no stochastic methods, no random seeds. Optimization is gradient-based only;
 L-BFGS (two-loop recursion) in pure numpy for deterministic convergence to minima.
+Analytical gradients (grad_full) are used by default when energy is e_tot_ca_with_bonds;
+no finite differences for that path. Optional scipy.optimize.minimize(L-BFGS-B) if scipy available.
 
-The energy landscape is designed so that minima coincide with exact rational
-values: φ = -57°, ψ = -47°, rise = 3/2 Å, pitch = 27/5 Å (from diamond volume
-balance and f_φ). Results may be returned as fractions.Fraction where applicable.
-
-MIT License. Python 3.10+. Numpy only.
+MIT License. Python 3.10+. Numpy (scipy optional for L-BFGS-B).
 """
 
 from __future__ import annotations
@@ -24,6 +22,13 @@ from . import alpha_helix as _alpha_helix
 
 EnergyFunc = Callable[[np.ndarray, np.ndarray], float]
 GradFunc = Callable[[np.ndarray, np.ndarray], np.ndarray]
+
+_SCIPY_AVAILABLE: bool = False
+try:
+    from scipy.optimize import minimize as _scipy_minimize
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _scipy_minimize = None
 
 
 def _gradient_finite_difference(
@@ -118,28 +123,77 @@ def minimize_e_tot_lbfgs(
     project_bonds: bool = False,
     r_bond_min: float = 2.5,
     r_bond_max: float = 6.0,
+    use_scipy: bool = False,
+    trajectory_callback: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Minimize E using L-BFGS (deterministic). No random seed; same initial
     point always yields same result. If energy_func is None, use e_tot.
-    If grad_func is provided, use analytical gradient (no finite differences).
+    When energy_func is e_tot_ca_with_bonds and grad_func is None, analytical
+    grad_full is used (no finite differences). Otherwise if grad_func is provided,
+    it is used; else FD. If use_scipy=True and scipy is available, use
+    scipy.optimize.minimize(..., method='L-BFGS-B', jac=grad).
     If project_bonds=True, after each step project so consecutive Cα are in [r_min, r_max].
 
     Returns:
         positions_opt: (n, 3) in Å.
         info: {"e_final", "e_initial", "n_iter", "success", "message"}.
     """
+    from .folding_energy import e_tot_ca_with_bonds, grad_full
+
     ef = energy_func if energy_func is not None else e_tot
+    _grad_func = grad_func
+    if _grad_func is None and getattr(ef, "__name__", None) == "e_tot_ca_with_bonds":
+        _grad_func = lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=True, include_clash=True)
+
     x = np.array(positions_init, dtype=float).ravel()
     n = len(z_list)
     e0 = ef(x.reshape(n, 3), z_list)
 
+    if use_scipy and _SCIPY_AVAILABLE and _grad_func is not None:
+        def _jac(x_flat: np.ndarray) -> np.ndarray:
+            return _grad_func(x_flat.reshape(n, 3), z_list).ravel()
+
+        _step = [0]
+
+        def _cb(x_flat: np.ndarray) -> None:
+            if trajectory_callback is not None:
+                trajectory_callback(_step[0], x_flat.reshape(n, 3))
+            _step[0] += 1
+
+        if trajectory_callback is not None:
+            trajectory_callback(0, x.reshape(n, 3))
+            _step[0] = 1
+        res = _scipy_minimize(
+            lambda x_flat: ef(x_flat.reshape(n, 3), z_list),
+            x,
+            method="L-BFGS-B",
+            jac=_jac,
+            callback=_cb,
+            options={"maxiter": max_iter, "gtol": gtol},
+        )
+        if project_bonds:
+            x = _project_bonds(res.x.reshape(n, 3), r_min=r_bond_min, r_max=r_bond_max).ravel()
+        else:
+            x = res.x
+        pos_final = x.reshape(n, 3)
+        e_final = e_tot(pos_final, z_list)
+        return pos_final, {
+            "e_final": float(e_final),
+            "e_initial": float(e0),
+            "n_iter": res.nit,
+            "success": res.success,
+            "message": res.message or ("Converged" if res.success else "Max iterations"),
+        }
+
     def _grad(x_flat: np.ndarray) -> np.ndarray:
         pos = x_flat.reshape(n, 3)
-        if grad_func is not None:
-            return grad_func(pos, z_list).ravel()
+        if _grad_func is not None:
+            return _grad_func(pos, z_list).ravel()
         return _gradient_finite_difference(x_flat, z_list, eps, energy_func=ef)
 
+    if trajectory_callback is not None:
+        trajectory_callback(0, x.reshape(n, 3))
     grad = _grad(x)
     s_list: list[np.ndarray] = []
     y_list: list[np.ndarray] = []
@@ -170,6 +224,8 @@ def minimize_e_tot_lbfgs(
             step *= 0.5
         x_prev = x.copy()
         x = x_new
+        if trajectory_callback is not None:
+            trajectory_callback(it + 1, x.reshape(n, 3))
         grad_new = _grad(x)
         s_list.append(x - x_prev)
         y_list.append(grad_new - grad)

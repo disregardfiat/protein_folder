@@ -12,8 +12,31 @@ MIT License. Python 3.10+. Numpy only.
 
 from __future__ import annotations
 
+import json
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def write_trajectory_frame(file_handle: Optional[Any], step: int, positions: np.ndarray) -> None:
+    """
+    Append one frame to a trajectory log (JSONL). Safe to call with file_handle=None.
+    Format: {"t": step, "positions": [[x,y,z], ...]} per line, flush after each write
+    so that `tail -f` shows progress and the log can feed Manim or other viewers.
+    """
+    if file_handle is None:
+        return
+    positions = np.asarray(positions)
+    if positions.ndim == 1:
+        positions = positions.reshape(-1, 3)
+    file_handle.write(json.dumps({"t": step, "positions": positions.tolist()}) + "\n")
+    file_handle.flush()
+
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+    _HAS_SCIPY_SPATIAL = True
+except ImportError:
+    _cKDTree = None
+    _HAS_SCIPY_SPATIAL = False
 
 from .casp_submission import (
     _parse_fasta,
@@ -21,7 +44,16 @@ from .casp_submission import (
     _place_full_backbone,
     AA_1to3,
 )
-from .folding_energy import e_tot, e_tot_ca_with_bonds, grad_full, grad_bonds_only
+from .folding_energy import (
+    e_tot,
+    e_tot_ca_with_bonds,
+    grad_full,
+    grad_bonds_only,
+    rg_squared,
+    grad_rg_squared,
+    K_RG_DEFAULT,
+    K_RG_COLLAPSE,
+)
 from .gradient_descent_folding import minimize_e_tot_lbfgs, _project_bonds
 from .peptide_backbone import backbone_bond_lengths
 from .side_chain_placement import chi_angles_for_residue, side_chain_chi_preferences
@@ -35,33 +67,93 @@ def _minimize_bonds_fast(
     z_list: np.ndarray,
     max_iter: int = 30,
     fast_horizon: bool = False,
+    collapse: bool = False,
+    collapse_frac: float = 0.5,
+    loose_r_max: float = 8.0,
+    collapse_init_steps: int = 0,
+    k_rg_collapse: Optional[float] = None,
+    trajectory_log: Optional[Any] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Fast minimization for long chains. Default: bonds + full vector-sum horizon (analytical).
     fast_horizon=True: bonds-only (nearest-neighbor), for debugging/speed.
+
+    If collapse=True: two-stage annealing for globule formation.
+    - Optional compact init: collapse_init_steps of Rg-only + bond projection.
+    - Stage 1 (first collapse_frac of max_iter): add k_rg * grad(Rg²) to pull chain compact;
+      use loose_r_max in bond projection so chain can collapse. k_rg defaults to K_RG_COLLAPSE.
+    - Stage 2: standard bonds + horizon, r_max=6.0, refine.
     """
+    k_rg = k_rg_collapse if k_rg_collapse is not None else K_RG_COLLAPSE
     pos = np.array(ca_init, dtype=float)
     n = pos.shape[0]
-    for it in range(max_iter):
+    r_min_tight, r_max_tight = 2.5, 6.0
+    # During collapse allow tighter spacing (r_min_loose) so chain can compactify; projection won't re-extend
+    r_min_loose = 2.0
+    n_collapse = int(collapse_frac * max_iter) if collapse else 0
+    n_refine = max_iter - n_collapse
+    total_iter = 0
+
+    write_trajectory_frame(trajectory_log, 0, pos)
+
+    # Optional: compact init via Rg-only steps (pull toward COM while keeping bonds)
+    if collapse and collapse_init_steps > 0:
+        for _ in range(collapse_init_steps):
+            grad = (k_rg * grad_rg_squared(pos)).astype(pos.dtype)
+            g_norm = np.linalg.norm(grad)
+            if g_norm < 1e-9:
+                break
+            step = 1.0 / (g_norm + 1e-6)
+            pos = pos - step * grad
+            pos = _project_bonds(pos, r_min=r_min_loose, r_max=loose_r_max)
+            total_iter += 1
+            write_trajectory_frame(trajectory_log, total_iter, pos)
+
+    # Stage 1: collapse (loose bonds + Rg bias). Use bonds-only so horizon repulsion
+    # doesn't oppose the Rg pull; allow r_min_loose so projection doesn't re-extend.
+    # Larger step during collapse (1.5/g_norm) so chain actually moves toward COM.
+    if n_collapse > 0:
+        for it in range(n_collapse):
+            grad = grad_bonds_only(pos, r_min=r_min_loose, r_max=loose_r_max)
+            grad = grad + k_rg * grad_rg_squared(pos)
+            g_norm = np.linalg.norm(grad)
+            if g_norm < 1e-4:
+                break
+            step = 3.0 / (g_norm + 1e-6)  # larger step in collapse phase to reach compact state
+            pos = pos - step * grad
+            pos = _project_bonds(pos, r_min=r_min_loose, r_max=loose_r_max)
+            total_iter += 1
+            write_trajectory_frame(trajectory_log, total_iter, pos)
+
+    # Stage 2: refine (tight bonds, no Rg); project into standard [2.5, 6] Å
+    for it in range(n_refine):
         grad = (
             grad_bonds_only(pos)
             if fast_horizon
-            else grad_full(pos, z_list, include_bonds=True, include_horizon=True)
+            else grad_full(pos, z_list, include_bonds=True, include_horizon=True, include_clash=True)
         )
         g_norm = np.linalg.norm(grad)
         if g_norm < 1e-4:
             break
-        step = 0.5 / (g_norm + 1e-6)  # adaptive: small step when grad is large
+        step = 0.5 / (g_norm + 1e-6)
         pos = pos - step * grad
-        pos = _project_bonds(pos, r_min=2.5, r_max=6.0)
+        pos = _project_bonds(pos, r_min=r_min_tight, r_max=r_max_tight)
+        total_iter += 1
+        write_trajectory_frame(trajectory_log, total_iter, pos)
+
     z = np.full(n, 6)
     e_final = float(e_tot_ca_with_bonds(pos, z))
+    msg = "Bonds + horizon (fast path)"
+    if collapse:
+        msg = "Two-stage collapse + refine (long chain)"
+    elif fast_horizon:
+        msg = "Bonds-only (fast path)"
     return pos, {
         "e_final": e_final,
         "e_initial": e_final,
-        "n_iter": it + 1,
+        "n_iter": total_iter,
         "success": True,
-        "message": "Bonds-only (fast path)" if fast_horizon else "Bonds + horizon (fast path)",
+        "message": msg,
     }
 
 
@@ -91,6 +183,11 @@ def _full_backbone_positions_and_z(
     return positions, np.array(z_list)
 
 
+# Default max iterations for long-chain path (n_res > 50); two-stage collapse uses this
+LONG_CHAIN_MAX_ITER_DEFAULT = 250
+LONG_CHAIN_COLLAPSE_INIT_STEPS = 40
+
+
 def minimize_full_chain(
     sequence: str,
     ca_init: Optional[np.ndarray] = None,
@@ -100,6 +197,12 @@ def minimize_full_chain(
     include_sidechains: bool = False,
     fast_horizon: bool = False,
     side_chain_pack: bool = True,
+    quick: bool = False,
+        collapse: bool = True,
+        long_chain_max_iter: Optional[int] = None,
+        collapse_init_steps: Optional[int] = None,
+        k_rg_collapse: Optional[float] = None,
+        trajectory_log_path: Optional[str] = None,
 ) -> Dict[str, object]:
     """
     Full-chain minimization: minimize E_tot over Cα, then rebuild backbone.
@@ -108,11 +211,17 @@ def minimize_full_chain(
         sequence: One-letter amino acid sequence (or will be parsed from FASTA if needed).
         ca_init: Initial Cα positions (n_res, 3) in Å. If None, from SS-aware placement.
         ss_string: Optional SS string (H/E/C). If None and ca_init is None, predict_ss(sequence).
-        max_iter: L-BFGS max iterations.
+        max_iter: L-BFGS max iterations (short chains).
         gtol: Gradient tolerance for convergence.
         include_sidechains: If True, add Cβ positions (from ideal geometry); no full side chains yet.
         fast_horizon: If True, use bonds-only gradient (nearest-neighbor); faster, for debugging.
         side_chain_pack: If True and include_sidechains, run lightweight Cβ rotamer search after backbone.
+        quick: If True, rapid prototyping: no side chains, fewer iterations, relaxed gtol, bonds-only for long chains.
+        collapse: If True and n_res > 50, use two-stage annealing (Rg collapse then refine) for globule formation.
+        long_chain_max_iter: Max iterations for long-chain path (default 250). Used when n_res > 50.
+        collapse_init_steps: Optional Rg-only steps before main loop to get compact init (default 40 when collapse=True).
+        k_rg_collapse: Weight for Rg² term during collapse (default K_RG_COLLAPSE). Increase for stronger pull toward compact.
+        trajectory_log_path: If set, write each step's Cα positions to this file as JSONL (one {"t": step, "positions": [...]} per line, flush each line) for Manim or other viewers; use with `tail -f` to watch the run.
 
     Returns:
         dict with:
@@ -144,23 +253,51 @@ def minimize_full_chain(
         ca_init = np.asarray(ca_init, dtype=float)
         assert ca_init.shape == (n_res, 3)
     z_ca = _z_list_ca(seq)
-    # Fast path for long chains: analytical gradient (bonds + full horizon by default)
-    if n_res > 50:
-        ca_min, info = _minimize_bonds_fast(
-            ca_init, z_ca, max_iter=min(30, max_iter), fast_horizon=fast_horizon
-        )
-    else:
-        ca_min, info = minimize_e_tot_lbfgs(
-            ca_init,
-            z_ca,
-            max_iter=max_iter,
-            gtol=gtol,
-            energy_func=e_tot_ca_with_bonds,
-            grad_func=lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=not fast_horizon),
-            project_bonds=True,
-            r_bond_min=2.5,
-            r_bond_max=6.0,
-        )
+    if quick:
+        include_sidechains = False
+        side_chain_pack = False
+        fast_horizon = True
+        max_iter = min(100, max_iter)
+        gtol = max(1e-4, gtol)
+        collapse = False
+    long_iter = long_chain_max_iter if long_chain_max_iter is not None else LONG_CHAIN_MAX_ITER_DEFAULT
+    init_steps = collapse_init_steps if collapse_init_steps is not None else (LONG_CHAIN_COLLAPSE_INIT_STEPS if collapse and n_res > 50 else 0)
+    traj_file = None
+    if trajectory_log_path:
+        traj_file = open(trajectory_log_path, "w")
+    try:
+        # Fast path for long chains: two-stage collapse + refine by default (collapse=True)
+        if n_res > 50:
+            ca_min, info = _minimize_bonds_fast(
+                ca_init,
+                z_ca,
+                max_iter=long_iter,
+                fast_horizon=fast_horizon,
+                collapse=collapse,
+                collapse_frac=0.5,
+                collapse_init_steps=init_steps if collapse else 0,
+                k_rg_collapse=k_rg_collapse,
+                trajectory_log=traj_file,
+            )
+        else:
+            def _traj_cb(step: int, pos: np.ndarray) -> None:
+                write_trajectory_frame(traj_file, step, pos)
+
+            ca_min, info = minimize_e_tot_lbfgs(
+                ca_init,
+                z_ca,
+                max_iter=max_iter,
+                gtol=gtol,
+                energy_func=e_tot_ca_with_bonds,
+                grad_func=lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=not fast_horizon, include_clash=True),
+                project_bonds=True,
+                r_bond_min=2.5,
+                r_bond_max=6.0,
+                trajectory_callback=_traj_cb if traj_file else None,
+            )
+    finally:
+        if traj_file is not None:
+            traj_file.close()
     backbone_atoms = _place_full_backbone(ca_min, seq)
     pos_bb, z_bb = _full_backbone_positions_and_z(backbone_atoms)
     E_ca_final = float(e_tot(ca_min, z_ca))
@@ -258,11 +395,12 @@ def _side_chain_pack_light(
         v0 = _default_cb_vector(n_xyz, ca_xyz, c_xyz, r_ca_cb)
         axis = ca_xyz - n_xyz
         best_cb = cb_xyz
-        best_count = _count_clashes(cb_xyz, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash)
+        tree = _cKDTree(all_xyz) if _HAS_SCIPY_SPATIAL else None
+        best_count = _count_clashes(cb_xyz, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash, tree=tree)
         for chi1 in grid:
             v_rot = _rotate_vector_around_axis(v0, axis, chi1)
             cb_new = ca_xyz + v_rot
-            count = _count_clashes(cb_new, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash)
+            count = _count_clashes(cb_new, all_xyz, exclude=(i_n, i_ca, i_cb), r_clash=r_clash, tree=tree)
             if count < best_count:
                 best_count = count
                 best_cb = cb_new
@@ -411,13 +549,14 @@ def _chi_clash_and_grad(
     r_clash: float,
     k_clash: float,
 ) -> Tuple[float, np.ndarray]:
-    """Clash energy and analytical gradient w.r.t. chi_vec (degrees)."""
+    """Clash energy and analytical gradient w.r.t. chi_vec (degrees). Uses cKDTree when available for O(n log n)."""
     atoms_applied = _apply_chi_vec(atoms, sequence, chi_vec, cb_res_indices, cb_atom_indices, r_ca_cb)
     all_xyz = np.array([xyz for _, xyz in atoms_applied])
     n_chi = len(cb_res_indices)
     e = 0.0
     grad = np.zeros(n_chi)
     deg2rad = np.pi / 180.0
+    tree = _cKDTree(all_xyz) if _HAS_SCIPY_SPATIAL else None
     for k, res_i in enumerate(cb_res_indices):
         i_cb = cb_atom_indices[k]
         i_n, i_ca, i_c = i_cb - 2, i_cb - 1, i_cb + 2
@@ -429,9 +568,12 @@ def _chi_clash_and_grad(
         axis_n = axis / (np.linalg.norm(axis) + 1e-12)
         chi_rad = chi_vec[k] * deg2rad
         cb_xyz = all_xyz[i_cb]
-        v_cb = cb_xyz - ca_xyz
         dpos_dchi = _drot_dchi(v0, axis_n, chi_rad) * deg2rad
-        for j in range(len(all_xyz)):
+        if tree is not None:
+            neighbors = tree.query_ball_point(cb_xyz, r_clash)
+        else:
+            neighbors = range(len(all_xyz))
+        for j in neighbors:
             if j in (i_n, i_ca, i_cb):
                 continue
             d = all_xyz[j] - cb_xyz
@@ -457,8 +599,12 @@ def _count_clashes(
     all_xyz: np.ndarray,
     exclude: Tuple[int, ...],
     r_clash: float = 2.0,
+    tree: Any = None,
 ) -> int:
-    """Number of atoms in all_xyz (excluding indices in exclude) within r_clash of xyz."""
+    """Number of atoms in all_xyz (excluding indices in exclude) within r_clash of xyz. Optional tree from cKDTree(all_xyz) for O(log n) per query."""
+    if _HAS_SCIPY_SPATIAL and tree is not None:
+        idx = tree.query_ball_point(xyz, r_clash)
+        return sum(1 for i in idx if i not in exclude)
     d = np.linalg.norm(all_xyz - xyz, axis=1)
     mask = np.ones(len(d), dtype=bool)
     for i in exclude:

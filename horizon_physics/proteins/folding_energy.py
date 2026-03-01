@@ -45,23 +45,45 @@ CUTOFF = 12.0  # Å — neighbor list; horizon forces decay rapidly beyond this
 USE_NEIGHBOR_LIST = True
 
 
+# Optional scipy for O(n log n) range queries (neighbor list, clash)
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+    _SCIPY_SPATIAL = True
+except ImportError:
+    _cKDTree = None
+    _SCIPY_SPATIAL = False
+
+
 # Bond potential vector (pole): direction and magnitude along i→j; − at i, + at j
 def _pole(i: int, j: int, vec: np.ndarray) -> Tuple[int, int, np.ndarray]:
     return (i, j, np.asarray(vec, dtype=float))
 
 
 def build_neighbor_list(pos: np.ndarray, cutoff: float = CUTOFF) -> list:
-    """Pairs within cutoff; neigh[i] = [(j, r, unit), ...] for j > i only."""
+    """Pairs within cutoff; neigh[i] = [(j, r, unit), ...] for j > i only. Uses cKDTree if scipy available."""
     n = len(pos)
     neigh = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = pos[j] - pos[i]
-            r = np.linalg.norm(d)
-            if r < 1e-9 or r >= cutoff:
-                continue
-            unit = d / r
-            neigh[i].append((j, r, unit))
+    if _SCIPY_SPATIAL and n > 10:
+        tree = _cKDTree(pos)
+        for i in range(n):
+            idx = tree.query_ball_point(pos[i], cutoff)
+            for j in idx:
+                if j <= i:
+                    continue
+                d = pos[j] - pos[i]
+                r = np.linalg.norm(d)
+                if r < 1e-9 or r >= cutoff:
+                    continue
+                neigh[i].append((j, r, d / r))
+    else:
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = pos[j] - pos[i]
+                r = np.linalg.norm(d)
+                if r < 1e-9 or r >= cutoff:
+                    continue
+                unit = d / r
+                neigh[i].append((j, r, unit))
     return neigh
 
 
@@ -191,6 +213,61 @@ R_CLASH = 2.0      # Å, non-bonded atoms closer = clash
 K_BOND = 200.0 * HBAR_C_EV_ANG  # strong penalty to keep chain intact
 K_CLASH = 500.0 * HBAR_C_EV_ANG
 
+# Radius-of-gyration collapse bias (optional, for long-chain globule formation)
+K_RG_DEFAULT = 0.05 * HBAR_C_EV_ANG  # weight for E_rg = k_rg * Rg² (eV/Å²)
+# Stronger weight during two-stage collapse so Rg term can overcome horizon repulsion
+K_RG_COLLAPSE = 3.0 * HBAR_C_EV_ANG  # ~6 eV/Å²; use in stage 1 for 404-res globule
+
+
+def rg_squared(positions: np.ndarray) -> float:
+    """Rg² = (1/n) Σ_i |r_i - r_com|². Used for collapse bias (minimize to compactify)."""
+    n = positions.shape[0]
+    if n < 2:
+        return 0.0
+    com = np.mean(positions, axis=0)
+    return float(np.mean(np.sum((positions - com) ** 2, axis=1)))
+
+
+def grad_rg_squared(positions: np.ndarray) -> np.ndarray:
+    """Gradient of Rg² w.r.t. positions: (2/n)(r_i - r_com). Pulls atoms toward COM."""
+    n = positions.shape[0]
+    if n < 2:
+        return np.zeros_like(positions)
+    com = np.mean(positions, axis=0)
+    return (2.0 / n) * (positions - com)
+
+
+def _clash_pairs(
+    positions: np.ndarray,
+    r_clash: float,
+    window: int = 20,
+) -> List[Tuple[int, int, float, np.ndarray]]:
+    """List of (i, j, r, unit) for non-bonded pairs with r < r_clash, j - i in [2, window]. Uses cKDTree when available."""
+    n = positions.shape[0]
+    window = min(window, n)
+    out: List[Tuple[int, int, float, np.ndarray]] = []
+    if _SCIPY_SPATIAL and n > 10:
+        tree = _cKDTree(positions)
+        for i in range(n):
+            idx = tree.query_ball_point(positions[i], r_clash)
+            for j in idx:
+                if j <= i + 1 or j - i > window:
+                    continue
+                d = positions[j] - positions[i]
+                r = np.linalg.norm(d)
+                if r < 1e-12 or r >= r_clash:
+                    continue
+                out.append((i, j, r, d / r))
+    else:
+        for j in range(2, window + 1):
+            for i in range(n - j):
+                d = positions[i + j] - positions[i]
+                r = np.linalg.norm(d)
+                if r < 1e-12 or r >= r_clash:
+                    continue
+                out.append((i, i + j, r, d / r))
+    return out
+
 
 def e_tot_ca_with_bonds(
     positions: np.ndarray,
@@ -215,13 +292,10 @@ def e_tot_ca_with_bonds(
     r = np.where(r < 1e-12, 1.0, r)
     terms = np.where(r < r_min, (r_min - r) ** 2, np.where(r > r_max, (r - r_max) ** 2, 0.1 * (r - r_eq) ** 2))
     e += float(k_bond * np.sum(terms))
-    # Clash penalty: vectorized (windowed)
+    # Clash penalty (O(n log n) with cKDTree when scipy available)
     window = min(20, n)
-    for j in range(2, window + 1):
-        for i in range(n - j):
-            r = np.linalg.norm(positions[i + j] - positions[i])
-            if r < r_clash:
-                e += k_clash * (r_clash - r) ** 2
+    for i, j, r, _ in _clash_pairs(positions, r_clash, window):
+        e += k_clash * (r_clash - r) ** 2
     return e
 
 
@@ -275,15 +349,10 @@ def grad_bonds_only(
     grad = grad_from_poles(poles, n)
     if include_clash:
         window = min(20, n)
-        for j in range(2, window + 1):
-            for i in range(n - j):
-                d = positions[i + j] - positions[i]
-                r = np.linalg.norm(d)
-                if r < r_clash and r > 1e-12:
-                    g = -2 * k_clash * (r_clash - r)
-                    u = d / r
-                    grad[i] -= g * u
-                    grad[i + j] += g * u
+        for i, j, r, u in _clash_pairs(positions, r_clash, window):
+            g = -2 * k_clash * (r_clash - r)
+            grad[i] -= g * u
+            grad[j] += g * u
     return grad
 
 
