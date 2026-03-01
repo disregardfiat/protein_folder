@@ -15,7 +15,7 @@ import re
 import sys
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formataddr
+from email.utils import formataddr, make_msgid, formatdate
 
 from flask import Flask, request, Response
 
@@ -88,6 +88,8 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
     msg["Subject"] = subject
     msg["From"] = formataddr(("HQIV CASP Server", SMTP_FROM))
     msg["To"] = to_email
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
     msg.attach(MIMEText("PDB model attached (CASP format).", "plain"))
     part = MIMEText(pdb, "plain")
     part.add_header("Content-Disposition", "attachment", filename="model.pdb")
