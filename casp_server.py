@@ -1,9 +1,10 @@
 """
-CASP-compliant HTTP server: FASTA in → PDB out.
-POST /predict with body = FASTA (or Content-Type: application/json with {"fasta": "..."})
-  → 200 + PDB text (CASP format). If "email" param is set and SMTP is configured, also sends PDB by email.
-GET /health → 200 OK (for reverse proxy / liveness).
-SMTP (optional): set SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASSWORD, SMTP_FROM; SMTP_USE_TLS=1 (default) for STARTTLS. When set, results are also emailed to the request's "email" address.
+CASP-compliant HTTP server: FASTA in → PDB out (full structure via HKE + funnel).
+POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
+Uses minimize_full_chain_hierarchical with cone funnel (stages 1–2) then Cartesian refinement (stage 3).
+If "email" param is set and SMTP is configured, also sends PDB by email.
+GET /health → 200 OK.
+Env: SMTP_* for email; FUNNEL_RADIUS (default 10), FUNNEL_RADIUS_EXIT (default 20), USE_FAST_PREDICT=1 to skip HKE (geometric-only).
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
 
@@ -24,7 +25,28 @@ if __name__ != "__main__":
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-from horizon_physics.proteins import hqiv_predict_structure, hqiv_predict_structure_assembly
+from horizon_physics.proteins.casp_submission import _parse_fasta
+from horizon_physics.proteins import full_chain_to_pdb
+from horizon_physics.proteins.hierarchical import (
+    minimize_full_chain_hierarchical,
+    hierarchical_result_for_pdb,
+)
+
+# Fast path (geometric-only, no minimization): for testing or when USE_FAST_PREDICT=1
+try:
+    from horizon_physics.proteins import hqiv_predict_structure, hqiv_predict_structure_assembly
+except Exception:
+    hqiv_predict_structure = None
+    hqiv_predict_structure_assembly = None
+
+USE_FAST_PREDICT = os.environ.get("USE_FAST_PREDICT", "").strip().lower() in ("1", "true", "yes")
+FUNNEL_RADIUS = float(os.environ.get("FUNNEL_RADIUS", "10.0"))
+FUNNEL_RADIUS_EXIT = float(os.environ.get("FUNNEL_RADIUS_EXIT", "20.0"))
+HKE_MAX_ITER = (
+    int(os.environ.get("HKE_MAX_ITER_S1", "40")),
+    int(os.environ.get("HKE_MAX_ITER_S2", "60")),
+    int(os.environ.get("HKE_MAX_ITER_S3", "80")),
+)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB max FASTA
@@ -81,6 +103,80 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
         app.logger.warning("SMTP send failed: %s", e)
 
 
+def _sequence_from_input(raw: str) -> str:
+    """Extract one-letter sequence from FASTA or raw sequence."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    return _parse_fasta(s) if ">" in s or "\n" in s else "".join(c for c in s.upper() if c.isalpha())
+
+
+def _predict_hke_single(sequence: str) -> str:
+    """Run HKE + funnel for one chain; return PDB string (chain A)."""
+    pos, z_list = minimize_full_chain_hierarchical(
+        sequence,
+        include_sidechains=False,
+        funnel_radius=FUNNEL_RADIUS,
+        funnel_stiffness=1.0,
+        funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+        max_iter_stage1=HKE_MAX_ITER[0],
+        max_iter_stage2=HKE_MAX_ITER[1],
+        max_iter_stage3=HKE_MAX_ITER[2],
+    )
+    result = hierarchical_result_for_pdb(pos, z_list, sequence, include_sidechains=False)
+    return full_chain_to_pdb(result, chain_id="A")
+
+
+def _merge_pdb_chains(result_and_chain_ids: list[tuple[dict, str]]) -> str:
+    """Merge multiple (result, chain_id) into one PDB (MODEL 1) with renumbered atom IDs."""
+    from horizon_physics.proteins.casp_submission import AA_1to3
+    lines = ["MODEL     1"]
+    atom_id = 1
+    for result, chain_id in result_and_chain_ids:
+        backbone_atoms = result["backbone_atoms"]
+        sequence = result["sequence"]
+        include_sidechains = result.get("include_sidechains", False)
+        if not backbone_atoms:
+            continue
+        idx = 0
+        for res_id in range(1, result["n_res"] + 1):
+            res_1 = sequence[res_id - 1]
+            res_3 = AA_1to3.get(res_1, "UNK")
+            n_atoms_this = (5 if res_1 != "G" else 4) if include_sidechains else 4
+            for _ in range(n_atoms_this):
+                name, xyz = backbone_atoms[idx]
+                lines.append(
+                    f"ATOM  {atom_id:5d}  {name:2s}  {res_3:3s} {chain_id}{res_id:4d}    "
+                    f"{float(xyz[0]):8.3f}{float(xyz[1]):8.3f}{float(xyz[2]):8.3f}  1.00  0.00           "
+                )
+                atom_id += 1
+                idx += 1
+    lines.append("ENDMDL")
+    lines.append("END")
+    return "\n".join(lines)
+
+
+def _predict_hke_assembly(sequences: list[str]) -> str:
+    """Run HKE + funnel per chain; return one PDB with chain A, B, C, ...."""
+    chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    results = []
+    for i, seq in enumerate(sequences):
+        pos, z_list = minimize_full_chain_hierarchical(
+            seq,
+            include_sidechains=False,
+            funnel_radius=FUNNEL_RADIUS,
+            funnel_stiffness=1.0,
+            funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+            max_iter_stage1=HKE_MAX_ITER[0],
+            max_iter_stage2=HKE_MAX_ITER[1],
+            max_iter_stage3=HKE_MAX_ITER[2],
+        )
+        result = hierarchical_result_for_pdb(pos, z_list, seq, include_sidechains=False)
+        cid = chain_ids[i] if i < len(chain_ids) else "A"
+        results.append((result, cid))
+    return _merge_pdb_chains(results)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return Response("OK\n", status=200, mimetype="text/plain")
@@ -113,13 +209,26 @@ def predict():
     if not sequences:
         return Response("Missing FASTA/sequence in body, JSON, or form 'sequence'/'fasta'\n", status=400, mimetype="text/plain")
 
+    # Normalize to one-letter sequences (strip FASTA headers etc.)
+    seqs = [_sequence_from_input(s) for s in sequences]
+    seqs = [s for s in seqs if s]
+    if not seqs:
+        return Response("No valid sequence found.\n", status=400, mimetype="text/plain")
+
     to_email, job_title = _get_email_and_title()
 
     try:
-        if len(sequences) == 1:
-            pdb = hqiv_predict_structure(sequences[0])
+        if USE_FAST_PREDICT and hqiv_predict_structure is not None:
+            if len(seqs) == 1:
+                pdb = hqiv_predict_structure(sequences[0])
+            else:
+                pdb = hqiv_predict_structure_assembly(sequences)
         else:
-            pdb = hqiv_predict_structure_assembly(sequences)
+            # Full structure: HKE + funnel null search
+            if len(seqs) == 1:
+                pdb = _predict_hke_single(seqs[0])
+            else:
+                pdb = _predict_hke_assembly(seqs)
         if to_email:
             _send_pdb_email(to_email, pdb, job_title)
         return Response(pdb, status=200, mimetype="text/plain")
@@ -127,16 +236,49 @@ def predict():
         return Response(f"Prediction failed: {e}\n", status=500, mimetype="text/plain")
 
 
+# Links for / and /help
+REPO_URL = "https://github.com/disregardfiat/protein_folder"
+PYHQIV_URL = "https://pypi.org/project/pyhqiv/"
+PAPER_DOI_URL = "https://zenodo.org/records/18794890"
+
+
+@app.route("/help", methods=["GET"])
+def help_page():
+    """API and reference links."""
+    body = f"""HQIV CASP prediction server — help
+
+Submit: POST / or POST /predict with FASTA or form/JSON (sequence=, title=, email=).
+Multi-chain: send multiple sequence= values for assembly (chain A, B, C, ...).
+Results: PDB in response body; if email is set and SMTP configured, also sent by email.
+
+Endpoints:
+  GET  /       — this info and links
+  GET  /help   — this message
+  GET  /health — liveness
+  POST / or /predict — structure prediction (HKE + funnel)
+
+References:
+  Repository:  {REPO_URL}
+  pyhqiv:      {PYHQIV_URL}
+  Paper (DOI): {PAPER_DOI_URL}
+"""
+    return Response(body, status=200, mimetype="text/plain")
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """GET: info. POST: same as /predict (so base URL can be used as submission URL)."""
+    """GET: info and links. POST: same as /predict (submission URL)."""
     if request.method == "POST":
         return predict()
-    return Response(
-        "HQIV CASP server. POST FASTA to / or /predict, GET /health for liveness.\n",
-        status=200,
-        mimetype="text/plain",
-    )
+    body = f"""HQIV CASP server — full structure (HKE + funnel)
+
+  Repository:  {REPO_URL}
+  pyhqiv:      {PYHQIV_URL}
+  Paper (DOI): {PAPER_DOI_URL}
+
+  POST / or /predict with sequence(s); GET /help for API details.
+"""
+    return Response(body, status=200, mimetype="text/plain")
 
 
 if __name__ == "__main__":
