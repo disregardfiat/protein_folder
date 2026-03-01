@@ -56,8 +56,28 @@ SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_FROM = os.environ.get("SMTP_FROM") or (SMTP_USER if SMTP_USER else "noreply@localhost")
+SMTP_FROM_RAW = os.environ.get("SMTP_FROM") or (SMTP_USER if SMTP_USER else "")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").strip().lower() in ("1", "true", "yes")
+
+
+def _smtp_from_address() -> str:
+    """Return RFC 5322–compliant From address (user@domain). Gmail rejects bare local parts. Domain is SMTP_HOST with leading 'mail.' (or first label) removed."""
+    addr = (SMTP_FROM_RAW or "").strip()
+    if re.match(r"^[^@]+@[^@]+\.[^@]+", addr):
+        return addr
+    if SMTP_USER and "@" in SMTP_USER:
+        return SMTP_USER
+    # Use domain without mail. prefix: mail.comodomodo.com.py -> comodomodo.com.py
+    domain = (SMTP_HOST or "").strip()
+    if domain.startswith("mail."):
+        domain = domain[5:]
+    elif "." in domain:
+        domain = domain.split(".", 1)[1]  # drop first label
+    if SMTP_USER and domain:
+        return f"{SMTP_USER}@{domain}"
+    if domain:
+        return f"noreply@{domain}"
+    return "noreply@localhost"
 
 
 def _get_email_and_title() -> tuple[str | None, str | None]:
@@ -86,7 +106,8 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
     subject = f"HQIV prediction: {title}" if title else "HQIV structure prediction"
     msg = MIMEMultipart()
     msg["Subject"] = subject
-    msg["From"] = formataddr(("HQIV CASP Server", SMTP_FROM))
+    from_addr = _smtp_from_address()
+    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
     msg["To"] = to_email
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
@@ -100,7 +121,7 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
             if SMTP_USE_TLS:
                 smtp.starttls()
             smtp.login(SMTP_USER, SMTP_PASSWORD)
-            smtp.sendmail(SMTP_FROM, [to_email], msg.as_string())
+            smtp.sendmail(from_addr, [to_email], msg.as_string())
     except Exception as e:
         app.logger.warning("SMTP send failed: %s", e)
 
