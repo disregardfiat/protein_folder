@@ -4,6 +4,10 @@ Staged hierarchical minimization: coarse rigid-body + torsions -> refinement -> 
 Runs on Protein instance; uses backend (JAX if available) for acceleration.
 Stage 1: minimize E over DOFs (6 + 2*(n_res-1)). Stage 2: same with tighter tolerance.
 Stage 3: flat Cartesian refinement using existing grad_full on positions.
+
+Funnel/ribosome as null search space: stages 1-2 approximate a confined volume (helices form,
+then group translations); stage 3 corresponds to exit, allowing complex self-wrapping.
+Optional funnel_radius (soft cone from first to last COM) bounds group COMs in stage 1-2.
 """
 
 from __future__ import annotations
@@ -97,6 +101,9 @@ def _energy_from_dofs(protein: Protein, dofs: Any, inter_group_weight: float = 0
         include_clash=kwargs.get("include_clash", True),
         inter_group_weight=inter_group_weight,
         inter_group_length_scale=kwargs.get("inter_group_length_scale", 8.0),
+        funnel_radius=kwargs.get("funnel_radius"),
+        funnel_stiffness=kwargs.get("funnel_stiffness", 1.0),
+        funnel_radius_exit=kwargs.get("funnel_radius_exit"),
     )
 
 
@@ -160,11 +167,18 @@ def run_staged_minimization(
     inter_group_weight_stage1: float = INTER_GROUP_WEIGHT_STAGE1,
     inter_group_weight_stage2: float = INTER_GROUP_WEIGHT_STAGE2,
     trajectory_log_path: Optional[str] = None,
+    funnel_radius: Optional[float] = None,
+    funnel_stiffness: float = 1.0,
+    funnel_radius_exit: Optional[float] = None,
 ) -> Tuple[Any, dict]:
     """
     Stage 1 (coarse): high inter-group COM attraction + compact init; minimize over all DOFs.
     Stage 2 (fine): lower inter-group weight + full e_tot; refine DOFs.
-    Stage 3: flat Cartesian refinement (grad_full on positions).
+    Stage 3: flat Cartesian refinement (grad_full on positions); funnel off (exit).
+
+    Funnel as null search space: when funnel_radius is set, a soft cone (axis = first→last COM,
+    radius grows from funnel_radius at first COM to funnel_radius_exit at last; default 2× for cone)
+    confines group COMs in stages 1-2; stage 3 has no funnel so the chain can wrap.
 
     Returns (positions (N, 3), info dict with e_final, n_iter, etc.).
     """
@@ -187,21 +201,35 @@ def run_staged_minimization(
         _write_trajectory_frame_6dof(traj_file, _step[0], pos_6dof)
         _step[0] += 1
 
+    funnel_kwargs = (
+        {
+            "funnel_radius": funnel_radius,
+            "funnel_stiffness": funnel_stiffness,
+            "funnel_radius_exit": funnel_radius_exit,
+        }
+        if (funnel_radius is not None and funnel_radius > 0)
+        else {}
+    )
+
     try:
-        # Compact init for Stage 1 (group COMs in a ball)
+        # Compact init for Stage 1 (group COMs in a ball; funnel soft-bounds COMs in 1-2 when set)
         if use_compact_init and protein.n_res > 1:
             dofs = generate_compact_start(protein.n_res, radius=5.0, seed=42)
             protein.set_dofs(dofs)
             dofs = protein.get_dofs()
         _log_frame()
 
-        # Stage 1: coarse — high inter-group attraction
+        # Stage 1: coarse — high inter-group attraction + funnel (if set)
         if _SCIPY:
             def obj1(x):
-                return _energy_from_dofs(protein, x, inter_group_weight=inter_group_weight_stage1)
+                return _energy_from_dofs(
+                    protein, x, inter_group_weight=inter_group_weight_stage1, **funnel_kwargs
+                )
 
             def jac1(x):
-                return _grad_dofs_fd(protein, x, inter_group_weight=inter_group_weight_stage1)
+                return _grad_dofs_fd(
+                    protein, x, inter_group_weight=inter_group_weight_stage1, **funnel_kwargs
+                )
 
             def cb1(x):
                 protein.set_dofs(x)
@@ -220,7 +248,9 @@ def run_staged_minimization(
             info["stage1_iter"] = res1.nit
         else:
             for _ in range(max_iter_stage1):
-                g = _grad_dofs_fd(protein, dofs, inter_group_weight=inter_group_weight_stage1)
+                g = _grad_dofs_fd(
+                    protein, dofs, inter_group_weight=inter_group_weight_stage1, **funnel_kwargs
+                )
                 g_norm = float(xp.linalg.norm(g))
                 if g_norm < gtol:
                     break
@@ -229,14 +259,18 @@ def run_staged_minimization(
                 _log_frame()
             info["stage1_iter"] = max_iter_stage1
 
-        # Stage 2: fine — lower inter-group weight, full e_tot
+        # Stage 2: fine — lower inter-group weight, full e_tot + funnel (if set)
         dofs = protein.get_dofs()
         if _SCIPY:
             def obj2(x):
-                return _energy_from_dofs(protein, x, inter_group_weight=inter_group_weight_stage2)
+                return _energy_from_dofs(
+                    protein, x, inter_group_weight=inter_group_weight_stage2, **funnel_kwargs
+                )
 
             def jac2(x):
-                return _grad_dofs_fd(protein, x, inter_group_weight=inter_group_weight_stage2)
+                return _grad_dofs_fd(
+                    protein, x, inter_group_weight=inter_group_weight_stage2, **funnel_kwargs
+                )
 
             def cb2(x):
                 protein.set_dofs(x)
@@ -254,7 +288,9 @@ def run_staged_minimization(
             info["stage2_iter"] = res2.nit
         else:
             for _ in range(max_iter_stage2):
-                g = _grad_dofs_fd(protein, protein.get_dofs(), inter_group_weight=inter_group_weight_stage2)
+                g = _grad_dofs_fd(
+                    protein, protein.get_dofs(), inter_group_weight=inter_group_weight_stage2, **funnel_kwargs
+                )
                 if float(xp.linalg.norm(g)) < gtol * 0.5:
                     break
                 dofs = protein.get_dofs() - 0.005 * g
@@ -287,6 +323,9 @@ def minimize_full_chain_hierarchical(
     max_iter_stage3: int = 100,
     gtol: float = 1e-5,
     trajectory_log_path: Optional[str] = None,
+    funnel_radius: Optional[float] = None,
+    funnel_stiffness: float = 1.0,
+    funnel_radius_exit: Optional[float] = None,
 ) -> Tuple[Any, Any]:
     """
     Drop-in hierarchical minimizer. Returns (positions (N, 3), atom_types (N,) z_shell).
@@ -300,6 +339,9 @@ def minimize_full_chain_hierarchical(
         domain_ranges: For grouping_strategy='domain', list of (start, end).
         max_iter_stage1/2/3: Iteration limits per stage.
         gtol: Gradient tolerance.
+        funnel_radius: Optional cone narrow-end radius (Å) for null-search bound in stages 1-2; None = off.
+        funnel_stiffness: Soft-wall stiffness when funnel_radius is set.
+        funnel_radius_exit: Cone exit radius (Å); default 2× funnel_radius. Set = funnel_radius for cylinder.
 
     Returns:
         pos: (N, 3) NumPy array in Å (backbone N, CA, C, O per residue).
@@ -324,6 +366,9 @@ def minimize_full_chain_hierarchical(
         gtol=gtol,
         device=device,
         trajectory_log_path=trajectory_log_path,
+        funnel_radius=funnel_radius,
+        funnel_stiffness=funnel_stiffness,
+        funnel_radius_exit=funnel_radius_exit,
     )
     # Get z_list from final state (same order as positions: N, CA, C, O per residue)
     _, z_list = protein.forward_kinematics()

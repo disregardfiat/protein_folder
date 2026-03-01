@@ -39,4 +39,6 @@ pos, atom_types = minimize_full_chain_hierarchical(
 1. **Stage 1–2**: Minimize total energy over DOFs (6 for first residue, φ/ψ for the rest) with L-BFGS (or gradient descent).
 2. **Stage 3**: Flat Cartesian refinement using existing `grad_full` on the FK positions for final polish.
 
+The staging is aligned with the **funnel/ribosome as null search space**: the accessible volume is the natural bound so that (1) helices form inside the bound, (2) group-level translations explore within it, and (3) at “exit” (stage 3) the chain can wrap into itself for tertiary contacts. See \texttt{docs/funnel\_null\_search.md}.
+
 All new code lives under `horizon_physics/proteins/hierarchical/`; the flat pipeline is unchanged except for an optional import of `minimize_full_chain_hierarchical` in the package `__init__.py`.

@@ -1,0 +1,4 @@
+# CASP HTTP server (install after requirements.txt)
+-r requirements.txt
+flask>=2.0
+gunicorn>=21.0

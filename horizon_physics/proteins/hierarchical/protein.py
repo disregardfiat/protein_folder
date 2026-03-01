@@ -321,6 +321,51 @@ class Protein:
                 e += np.exp(-d / length_scale)
         return float(scale * e)
 
+    def _funnel_penalty(
+        self,
+        pos: Any,
+        funnel_radius: float,
+        stiffness: float = 1.0,
+        funnel_radius_exit: Optional[float] = None,
+    ) -> float:
+        """
+        Soft cone funnel: axis from first to last group COM; penalize group COMs outside local radius.
+        Radius grows linearly along the axis: R(t) = funnel_radius + t * (funnel_radius_exit - funnel_radius),
+        with t in [0, 1] from first to last COM. If funnel_radius_exit is None, R(t) = funnel_radius (cylinder).
+        E_funnel = stiffness * sum over i of max(0, d_i - R(t_i))^2.
+        """
+        import numpy as np
+        coms = self._group_coms_from_positions(pos)
+        n = len(coms)
+        if n < 2 or funnel_radius <= 0:
+            return 0.0
+        # Default cone: exit radius twice narrow end; set funnel_radius_exit=funnel_radius for cylinder
+        r_exit = (2.0 * funnel_radius) if funnel_radius_exit is None else funnel_radius_exit
+        a = np.asarray(coms[0], dtype=np.float64)
+        b = np.asarray(coms[-1], dtype=np.float64)
+        v = b - a
+        v_sq = float(np.dot(v, v))
+        if v_sq < 1e-20:
+            # Degenerate axis: treat as point; use max radius for cylinder-like penalty
+            r_local = max(funnel_radius, r_exit)
+            e = 0.0
+            for i in range(n):
+                d = np.linalg.norm(coms[i] - a)
+                if d > r_local:
+                    e += (d - r_local) ** 2
+            return float(stiffness * e)
+        e = 0.0
+        for i in range(n):
+            w = np.asarray(coms[i], dtype=np.float64) - a
+            t = np.dot(w, v) / v_sq
+            t = max(0.0, min(1.0, float(t)))
+            r_allowed = funnel_radius + t * (r_exit - funnel_radius)
+            q = a + t * v
+            d = float(np.linalg.norm(coms[i] - q))
+            if d > r_allowed:
+                e += (d - r_allowed) ** 2
+        return float(stiffness * e)
+
     def compute_total_energy(
         self,
         include_bonds: bool = True,
@@ -328,12 +373,22 @@ class Protein:
         include_clash: bool = True,
         inter_group_weight: float = 0.0,
         inter_group_length_scale: float = 8.0,
+        funnel_radius: Optional[float] = None,
+        funnel_stiffness: float = 1.0,
+        funnel_radius_exit: Optional[float] = None,
     ) -> float:
-        """Reuses existing energy + optional group-level COM–COM attraction between non-adjacent groups."""
+        """Reuses existing energy + optional group-level COM–COM attraction + optional funnel (cone) soft bound."""
         pos, z_list = self.forward_kinematics()
         e = float(_energy.energy_total(pos, z_list, include_bonds, include_horizon, include_clash))
         if inter_group_weight > 0:
             e += self._inter_group_attraction(pos, scale=inter_group_weight, length_scale=inter_group_length_scale)
+        if funnel_radius is not None and funnel_radius > 0:
+            e += self._funnel_penalty(
+                pos,
+                funnel_radius=funnel_radius,
+                stiffness=funnel_stiffness,
+                funnel_radius_exit=funnel_radius_exit,
+            )
         return e
 
     def minimize_hierarchical(
@@ -344,10 +399,14 @@ class Protein:
         gtol: float = 1e-5,
         device: Optional[str] = None,
         trajectory_log_path: Optional[str] = None,
+        funnel_radius: Optional[float] = None,
+        funnel_stiffness: float = 1.0,
+        funnel_radius_exit: Optional[float] = None,
     ) -> Tuple[Any, dict]:
         """
         Staged optimization: (1) coarse rigid-body 6DOF + torsions, (2) internal torsions refinement,
         (3) optional final flat Cartesian refinement. Returns (positions (N,3), info dict).
+        When funnel_radius is set, a soft cone confines group COMs in stages 1-2 (off in stage 3).
         """
         from .minimize_hierarchical import run_staged_minimization
         return run_staged_minimization(
@@ -358,6 +417,9 @@ class Protein:
             gtol=gtol,
             device=device,
             trajectory_log_path=trajectory_log_path,
+            funnel_radius=funnel_radius,
+            funnel_stiffness=funnel_stiffness,
+            funnel_radius_exit=funnel_radius_exit,
         )
 
 
