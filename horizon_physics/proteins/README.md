@@ -120,6 +120,7 @@ pdb_str = full_chain_to_pdb(result, chain_id="A")
 - **Side-chain pack:** If `include_sidechains=True`, rotamer packing runs after backbone: χ1 from `side_chain_chi_preferences()` (grid pref±120°, ±60°, 0°) then 5 L-BFGS steps on χ1 to minimize clash energy. Disable with `side_chain_pack=False`. Optional standalone: `pack_sidechains(result)`.
 - **Quick mode:** `minimize_full_chain(..., quick=True)` disables side chains, uses fewer iterations and relaxed gtol, and bonds-only gradient for rapid prototyping.
 - **Long-chain collapse:** For n_res > 50, `collapse=True` (default) runs two-stage annealing (Rg collapse then refine). Tune with `long_chain_max_iter` (default 250), `collapse_init_steps` (default 40), or `k_rg_collapse` to strengthen the Rg pull. Set `collapse=False` to skip and use the original single-stage path.
+- **Co-translational ribosome tunnel:** `simulate_ribosome_tunnel=True` (default `False`) enables a physics-first co-translational mode: a null search cone (exit tunnel, `cone_half_angle_deg=12`, `tunnel_length=25` Å), a plane at the tunnel lip to null unphysical re-entry (`lip_plane_distance=0`), fast-pass spaghetti building (rigid-group 6-DOF + bell-end large translations only), and one short HKE minimization pass on each connection event. The chain is aligned with the tunnel axis (default +Z; override with `tunnel_axis`). See `horizon_physics/proteins/co_translational_tunnel.py` and unit tests in `test_co_translational_tunnel.py`.
 
 ### Current algorithm (full-chain pipeline)
 

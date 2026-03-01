@@ -31,6 +31,23 @@ pip install "jax[tpu]"
 # or if libtpu download fails: pip install libtpu -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 
+### Co-translational ribosome tunnel (optional)
+
+Simulate the ribosome exit tunnel: null search cone, plane at the lip, fast-pass spaghetti (rigid group + bell-end translations), and a short HKE min pass on each connection:
+
+```bash
+python -c "
+from horizon_physics.proteins import minimize_full_chain, full_chain_to_pdb
+result = minimize_full_chain(
+    'MKFLNDR',
+    simulate_ribosome_tunnel=True,
+    tunnel_length=25.0,
+    cone_half_angle_deg=12.0,
+)
+print(full_chain_to_pdb(result))
+"
+```
+
 ## Package
 
 - **`horizon_physics/proteins/`** — Full HQIV protein folding pipeline

@@ -47,10 +47,11 @@ except Exception:
 USE_FAST_PREDICT = os.environ.get("USE_FAST_PREDICT", "").strip().lower() in ("1", "true", "yes")
 FUNNEL_RADIUS = float(os.environ.get("FUNNEL_RADIUS", "10.0"))
 FUNNEL_RADIUS_EXIT = float(os.environ.get("FUNNEL_RADIUS_EXIT", "20.0"))
+# HKE uses finite-difference gradient (2 * n_dofs evals per step; ~572/step for 141 res). Funnel is on; bottleneck is FD, not funnel. Lower iters so server runs finish in ~10–20 min per chain.
 HKE_MAX_ITER = (
-    int(os.environ.get("HKE_MAX_ITER_S1", "40")),
-    int(os.environ.get("HKE_MAX_ITER_S2", "60")),
-    int(os.environ.get("HKE_MAX_ITER_S3", "80")),
+    int(os.environ.get("HKE_MAX_ITER_S1", "15")),
+    int(os.environ.get("HKE_MAX_ITER_S2", "25")),
+    int(os.environ.get("HKE_MAX_ITER_S3", "50")),
 )
 
 app = Flask(__name__)
@@ -411,9 +412,37 @@ def health():
     return Response("OK\n", status=200, mimetype="text/plain")
 
 
+def _run_job_in_background(job_id: str) -> None:
+    """Run prediction for job_id (read from pending .request.json); move to outputs and send email on success. No-op if .request.json missing or job already done."""
+    req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
+    if not os.path.isfile(req_path):
+        return
+    try:
+        with open(req_path) as f:
+            req = json.load(f)
+    except Exception:
+        return
+    sequences = req.get("sequences") or []
+    seqs = [_sequence_from_input(s) for s in sequences if s]
+    if not seqs:
+        return
+    to_email = (req.get("email") or "").strip()
+    job_title = req.get("title")
+    try:
+        if USE_FAST_PREDICT and hqiv_predict_structure is not None:
+            pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
+        else:
+            pdb = _predict_hke_assembly(seqs) if len(seqs) > 1 else _predict_hke_single(seqs[0])
+        _move_to_outputs(job_id, pdb)
+        if to_email:
+            _send_pdb_email(to_email, pdb, job_title)
+    except Exception as e:
+        app.logger.warning("Background job %s failed: %s", job_id, e)
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Accept FASTA in body, JSON, or form (sequence= / fasta= / title= / email= / inchi=). Multi-chain: form/JSON can send multiple sequence values; returns one PDB with chain A,B,C,.... If email set and SMTP configured, also sends PDB to that address."""
+    """Accept FASTA in body, JSON, or form (sequence= / fasta= / title= / email=). Queues the job, returns 200 immediately with job_id; prediction runs in background. If email set and SMTP configured, PDB is sent by email when done."""
     sequences = None
     if request.is_json:
         data = request.get_json(silent=True) or {}
@@ -449,24 +478,14 @@ def predict():
     _write_pending_txt(job_id, job_title, to_email, len(seqs), [len(s) for s in seqs])
     _write_pending_request(job_id, sequences, job_title, to_email)
 
-    try:
-        if USE_FAST_PREDICT and hqiv_predict_structure is not None:
-            if len(seqs) == 1:
-                pdb = hqiv_predict_structure(sequences[0])
-            else:
-                pdb = hqiv_predict_structure_assembly(sequences)
-        else:
-            # Full structure: HKE + funnel null search
-            if len(seqs) == 1:
-                pdb = _predict_hke_single(seqs[0])
-            else:
-                pdb = _predict_hke_assembly(seqs)
-        _move_to_outputs(job_id, pdb)
-        if to_email:
-            _send_pdb_email(to_email, pdb, job_title)
-        return Response(pdb, status=200, mimetype="text/plain")
-    except Exception as e:
-        return Response(f"Prediction failed: {e}\n", status=500, mimetype="text/plain")
+    # Run prediction in background; return 200 immediately once queued
+    thread = threading.Thread(target=_run_job_in_background, args=(job_id,), daemon=True)
+    thread.start()
+    return Response(
+        json.dumps({"status": "queued", "job_id": job_id}),
+        status=200,
+        mimetype="application/json",
+    )
 
 
 # Links for / and /help

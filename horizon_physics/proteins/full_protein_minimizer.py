@@ -55,6 +55,7 @@ from .folding_energy import (
     K_RG_COLLAPSE,
 )
 from .gradient_descent_folding import minimize_e_tot_lbfgs, _project_bonds
+from . import co_translational_tunnel as _tunnel
 from .peptide_backbone import backbone_bond_lengths
 from .side_chain_placement import chi_angles_for_residue, side_chain_chi_preferences
 
@@ -198,11 +199,17 @@ def minimize_full_chain(
     fast_horizon: bool = False,
     side_chain_pack: bool = True,
     quick: bool = False,
-        collapse: bool = True,
-        long_chain_max_iter: Optional[int] = None,
-        collapse_init_steps: Optional[int] = None,
-        k_rg_collapse: Optional[float] = None,
-        trajectory_log_path: Optional[str] = None,
+    collapse: bool = True,
+    long_chain_max_iter: Optional[int] = None,
+    collapse_init_steps: Optional[int] = None,
+    k_rg_collapse: Optional[float] = None,
+    trajectory_log_path: Optional[str] = None,
+    simulate_ribosome_tunnel: bool = False,
+    tunnel_length: float = 25.0,
+    cone_half_angle_deg: float = 12.0,
+    lip_plane_distance: float = 0.0,
+    tunnel_axis: Optional[np.ndarray] = None,
+    hke_above_tunnel_fraction: float = 0.5,
 ) -> Dict[str, object]:
     """
     Full-chain minimization: minimize E_tot over Cα, then rebuild backbone.
@@ -222,6 +229,12 @@ def minimize_full_chain(
         collapse_init_steps: Optional Rg-only steps before main loop to get compact init (default 40 when collapse=True).
         k_rg_collapse: Weight for Rg² term during collapse (default K_RG_COLLAPSE). Increase for stronger pull toward compact.
         trajectory_log_path: If set, write each step's Cα positions to this file as JSONL (one {"t": step, "positions": [...]} per line, flush each line) for Manim or other viewers; use with `tail -f` to watch the run.
+        simulate_ribosome_tunnel: If True, use co-translational mode: null search cone (exit tunnel), plane at lip to null unphysical re-entry, fast-pass spaghetti (rigid group + bell-end large translations), and a short HKE min pass on each connection event. Default False for backward compatibility.
+        tunnel_length: Length of tunnel in Å along extrusion axis (default 25.0). Residues with Cα inside this segment are cone-constrained.
+        cone_half_angle_deg: Half-angle of the cone in degrees (default 12.0). Cα inside the tunnel must stay within this cone from the peptidyl transferase center.
+        lip_plane_distance: Extra distance in Å beyond tunnel_length for the lip plane (default 0.0). Lip is at tunnel_length + lip_plane_distance along the axis.
+        tunnel_axis: (3,) unit vector for tunnel axis; default +Z. Chain is aligned so N-terminus is at origin and extrusion is along this axis.
+        hke_above_tunnel_fraction: When simulate_ribosome_tunnel=True, HKE (connection-triggered L-BFGS) is applied only to residues above this fraction of the tunnel length (default 0.5 = 50%). The chain is built with the fast method (rigid group + bell-end); only the part above this threshold is updated by the min pass.
 
     Returns:
         dict with:
@@ -266,8 +279,32 @@ def minimize_full_chain(
     if trajectory_log_path:
         traj_file = open(trajectory_log_path, "w")
     try:
-        # Fast path for long chains: two-stage collapse + refine by default (collapse=True)
-        if n_res > 50:
+        # Co-translational ribosome tunnel mode: cone + lip plane, fast-pass spaghetti, connection-triggered HKE
+        if simulate_ribosome_tunnel:
+            ptc_origin = np.zeros(3)
+            axis = _tunnel._normalize_axis(tunnel_axis) if tunnel_axis is not None else _tunnel.DEFAULT_TUNNEL_AXIS.copy()
+            grad_func = lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=True, include_clash=True)
+            ca_min, info = _tunnel.co_translational_minimize(
+                ca_init,
+                z_ca,
+                ptc_origin,
+                axis,
+                tunnel_length=tunnel_length,
+                cone_half_angle_deg=cone_half_angle_deg,
+                lip_plane_distance=lip_plane_distance,
+                grad_func=grad_func,
+                project_bonds=_project_bonds,
+                n_bell=2,
+                fast_pass_steps_per_connection=5,
+                min_pass_iter_per_connection=15,
+                r_bond_min=2.5,
+                r_bond_max=6.0,
+                hke_above_tunnel_fraction=hke_above_tunnel_fraction,
+            )
+            if traj_file is not None:
+                write_trajectory_frame(traj_file, 0, ca_min)
+        # Standard HKE path (unchanged): fast path for long chains or L-BFGS for short
+        elif n_res > 50:
             ca_min, info = _minimize_bonds_fast(
                 ca_init,
                 z_ca,
