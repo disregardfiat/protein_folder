@@ -188,6 +188,26 @@ def rigid_body_gradient_for_group(
         grad[i] = F + np.cross(omega, r[idx])
 
 
+def rigid_body_force_torque(
+    positions: np.ndarray,
+    grad: np.ndarray,
+    indices: List[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return (F, T) for a rigid group: F = sum(grad[i]), T = sum((pos[i]-com) × grad[i]).
+    Used to form 6-DOF gradient for ligand refinement (dE/dt = F, dE/deuler ≈ T).
+    """
+    if not indices:
+        return np.zeros(3), np.zeros(3)
+    pos_group = positions[indices]
+    grad_group = grad[indices]
+    com = np.mean(pos_group, axis=0)
+    F = np.sum(grad_group, axis=0)
+    r = pos_group - com
+    T = np.sum(np.cross(r, grad_group), axis=0)
+    return F, T
+
+
 def bell_end_indices(n_res: int, n_bell: int = 2) -> List[int]:
     """Indices of the last n_bell residues (bell end; 1 or 2 typically)."""
     if n_res <= 0:

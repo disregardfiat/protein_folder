@@ -40,6 +40,7 @@ from horizon_physics.proteins import (
     full_chain_to_pdb_complex,
     minimize_full_chain,
 )
+from horizon_physics.proteins.ligands import parse_ligands
 from horizon_physics.proteins.hierarchical import (
     minimize_full_chain_hierarchical,
     hierarchical_result_for_pdb,
@@ -54,6 +55,8 @@ except Exception:
     hqiv_predict_structure_assembly = None
 
 USE_FAST_PREDICT = os.environ.get("USE_FAST_PREDICT", "").strip().lower() in ("1", "true", "yes")
+# CAMEO custom free-parameter key for ligand input (must match registration)
+LIGAND_KEY = os.environ.get("CASP_LIGAND_KEY", "ligand")
 FUNNEL_RADIUS = float(os.environ.get("FUNNEL_RADIUS", "10.0"))
 FUNNEL_RADIUS_EXIT = float(os.environ.get("FUNNEL_RADIUS_EXIT", "20.0"))
 # HKE uses finite-difference gradient (2 * n_dofs evals per step; ~572/step for 141 res). Funnel is on; bottleneck is FD, not funnel. Lower iters so server runs finish in ~10–20 min per chain.
@@ -103,12 +106,21 @@ def _write_pending_txt(job_id: str, job_title: str | None, to_email: str | None,
         f.write("\n".join(lines))
 
 
-def _write_pending_request(job_id: str, sequences: list[str], job_title: str | None, to_email: str | None) -> None:
+def _write_pending_request(
+    job_id: str,
+    sequences: list[str],
+    job_title: str | None,
+    to_email: str | None,
+    ligand_str: str | None = None,
+) -> None:
     """Write pending/{job_id}.request.json so the job can be retried on restart."""
     _ensure_output_dirs()
     path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
+    payload = {"sequences": sequences, "title": job_title, "email": to_email}
+    if ligand_str is not None and ligand_str.strip():
+        payload[LIGAND_KEY] = ligand_str.strip()
     with open(path, "w") as f:
-        json.dump({"sequences": sequences, "title": job_title, "email": to_email}, f)
+        json.dump(payload, f)
 
 
 def _move_to_outputs(job_id: str, pdb_content: str) -> None:
@@ -441,6 +453,14 @@ def process_pending_jobs() -> None:
             continue
         to_email = (req.get("email") or "").strip()
         job_title = req.get("title")
+        ligand_str = (req.get(LIGAND_KEY) or "").strip()
+        parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
+        if parsed_ligands:
+            app.logger.info(
+                "Ligand detected via key %s → %d ligands added as 6-DOF agents",
+                LIGAND_KEY,
+                len(parsed_ligands),
+            )
         try:
             if USE_FAST_PREDICT and hqiv_predict_structure is not None:
                 pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
@@ -465,7 +485,11 @@ def process_pending_jobs() -> None:
                     if to_email:
                         _send_pdb_email(to_email, pdb, job_title)
             else:
-                pdb = _predict_hke_assembly(seqs) if len(seqs) > 1 else _predict_hke_single(seqs[0])
+                pdb = (
+                    _predict_hke_assembly(seqs)
+                    if len(seqs) > 1
+                    else _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
+                )
                 _move_to_outputs(job_id, pdb)
                 if to_email:
                     _send_pdb_email(to_email, pdb, job_title)
@@ -483,8 +507,16 @@ def _sequence_from_input(raw: str) -> str:
     return _parse_fasta(s) if ">" in s or "\n" in s else "".join(c for c in s.upper() if c.isalpha())
 
 
-def _predict_hke_single(sequence: str) -> str:
-    """Run HKE + funnel for one chain; return PDB string (chain A)."""
+def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
+    """Run HKE + funnel for one chain; return PDB string (chain A). If ligands provided, use minimize_full_chain with include_ligands and output HETATM."""
+    if ligands:
+        result = minimize_full_chain(
+            sequence,
+            include_sidechains=False,
+            include_ligands=True,
+            ligands=ligands,
+        )
+        return full_chain_to_pdb(result, chain_id="A", ligands=result.get("ligands"))
     pos, z_list = minimize_full_chain_hierarchical(
         sequence,
         include_sidechains=False,
@@ -640,6 +672,14 @@ def _run_job_in_background(job_id: str) -> None:
         return
     to_email = (req.get("email") or "").strip()
     job_title = req.get("title")
+    ligand_str = (req.get(LIGAND_KEY) or "").strip()
+    parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
+    if parsed_ligands:
+        app.logger.info(
+            "Ligand detected via key %s → %d ligands added as 6-DOF agents",
+            LIGAND_KEY,
+            len(parsed_ligands),
+        )
     try:
         if USE_FAST_PREDICT and hqiv_predict_structure is not None:
             pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
@@ -664,7 +704,11 @@ def _run_job_in_background(job_id: str) -> None:
                 if to_email:
                     _send_pdb_email(to_email, pdb, job_title)
         else:
-            pdb = _predict_hke_assembly(seqs) if len(seqs) > 1 else _predict_hke_single(seqs[0])
+            pdb = (
+                _predict_hke_assembly(seqs)
+                if len(seqs) > 1
+                else _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
+            )
             _move_to_outputs(job_id, pdb)
             if to_email:
                 _send_pdb_email(to_email, pdb, job_title)
@@ -708,9 +752,16 @@ def predict():
         return Response("No valid sequence found.\n", status=400, mimetype="text/plain")
 
     to_email, job_title = _get_email_and_title()
+    ligand_str = None
+    if request.is_json:
+        ligand_str = (request.get_json(silent=True) or {}).get(LIGAND_KEY)
+    if ligand_str is None and request.form:
+        ligand_str = request.form.get(LIGAND_KEY)
+    if ligand_str is not None and isinstance(ligand_str, str) and not ligand_str.strip():
+        ligand_str = None
     job_id = _job_id()
     _write_pending_txt(job_id, job_title, to_email, len(seqs), [len(s) for s in seqs])
-    _write_pending_request(job_id, sequences, job_title, to_email)
+    _write_pending_request(job_id, sequences, job_title, to_email, ligand_str=ligand_str)
 
     # Run prediction in background; return 200 immediately once queued
     thread = threading.Thread(target=_run_job_in_background, args=(job_id,), daemon=True)

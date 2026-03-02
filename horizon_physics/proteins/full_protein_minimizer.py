@@ -58,6 +58,8 @@ from .folding_energy import (
 )
 from .gradient_descent_folding import minimize_e_tot_lbfgs, _project_bonds
 from . import co_translational_tunnel as _tunnel
+from .co_translational_tunnel import rigid_body_force_torque
+from .ligands import LigandAgent, parse_ligands
 from .peptide_backbone import backbone_bond_lengths
 from .side_chain_placement import chi_angles_for_residue, side_chain_chi_preferences
 
@@ -199,6 +201,50 @@ def _full_backbone_positions_and_z(
 LONG_CHAIN_MAX_ITER_DEFAULT = 250
 LONG_CHAIN_COLLAPSE_INIT_STEPS = 40
 
+LIGAND_REFINE_STEPS = 50
+LIGAND_STEP_T = 0.05
+LIGAND_STEP_ANG = 0.02
+
+
+def _refine_ligands_6dof(
+    pos_bb: np.ndarray,
+    z_bb: np.ndarray,
+    ligands: List[LigandAgent],
+    max_steps: int = LIGAND_REFINE_STEPS,
+    step_t: float = LIGAND_STEP_T,
+    step_ang: float = LIGAND_STEP_ANG,
+) -> None:
+    """Minimize E_tot over ligand 6-DOF only; protein positions fixed. Modifies ligands in place."""
+    n_bb = pos_bb.shape[0]
+    n_lig_atoms = sum(lig.n_atoms() for lig in ligands)
+    if n_lig_atoms == 0:
+        return
+    z_lig = np.concatenate([lig.z_list for lig in ligands])
+    z_list = np.concatenate([z_bb, z_lig])
+    indices_per_ligand: List[List[int]] = []
+    off = n_bb
+    for lig in ligands:
+        n = lig.n_atoms()
+        indices_per_ligand.append(list(range(off, off + n)))
+        off += n
+
+    for _ in range(max_steps):
+        lig_pos = np.concatenate([lig.get_world_positions() for lig in ligands], axis=0)
+        combined = np.concatenate([pos_bb, lig_pos], axis=0)
+        # Bonds only within protein; horizon + clash for full system (no protein–ligand bonds)
+        grad = grad_full(
+            combined,
+            z_list,
+            include_bonds=False,
+            include_horizon=True,
+            include_clash=True,
+        )
+        grad[:n_bb] += grad_bonds_only(pos_bb, include_clash=False)
+        for lig, indices in zip(ligands, indices_per_ligand):
+            F, T = rigid_body_force_torque(combined, grad, indices)
+            t, euler = lig.get_6dof()
+            lig.set_6dof(t - step_t * F, euler - step_ang * T)
+
 
 def minimize_full_chain(
     sequence: str,
@@ -207,6 +253,8 @@ def minimize_full_chain(
     max_iter: int = 500,
     gtol: float = 1e-5,
     include_sidechains: bool = False,
+    include_ligands: bool = False,
+    ligands: Optional[List[LigandAgent]] = None,
     fast_horizon: bool = False,
     side_chain_pack: bool = True,
     quick: bool = False,
@@ -234,6 +282,8 @@ def minimize_full_chain(
         max_iter: L-BFGS max iterations (short chains).
         gtol: Gradient tolerance for convergence.
         include_sidechains: If True, add Cβ positions (from ideal geometry); no full side chains yet.
+        include_ligands: If True and ligands is non-empty, run 6-DOF rigid-body refinement for ligands against the fixed protein (horizon + clash). Default False for pure CAMEO compatibility.
+        ligands: List of LigandAgent (from parse_ligands). Used only when include_ligands=True.
         fast_horizon: If True, use bonds-only gradient (nearest-neighbor); faster, for debugging.
         side_chain_pack: If True and include_sidechains, run lightweight Cβ rotamer search after backbone.
         quick: If True, rapid prototyping: no side chains, fewer iterations, relaxed gtol, bonds-only for long chains.
@@ -430,7 +480,18 @@ def minimize_full_chain(
         backbone_atoms = _add_cb(backbone_atoms, seq)
         if side_chain_pack:
             backbone_atoms = _side_chain_pack_light(backbone_atoms, seq)
-    return {
+
+    ligand_list: Optional[List[LigandAgent]] = None
+    if include_ligands and ligands:
+        pos_bb, z_bb = _full_backbone_positions_and_z(backbone_atoms)
+        protein_com = np.mean(pos_bb, axis=0)
+        for lig in ligands:
+            t, euler = lig.get_6dof()
+            lig.set_6dof(protein_com.copy(), euler)
+        ligand_list = list(ligands)
+        _refine_ligands_6dof(pos_bb, z_bb, ligand_list)
+
+    out = {
         "ca_min": ca_min,
         "backbone_atoms": backbone_atoms,
         "E_ca_final": E_ca_final,
@@ -440,6 +501,9 @@ def minimize_full_chain(
         "sequence": seq,
         "include_sidechains": include_sidechains,
     }
+    if ligand_list is not None:
+        out["ligands"] = ligand_list
+    return out
 
 
 def pack_sidechains(
@@ -777,12 +841,15 @@ def _add_cb(
 def full_chain_to_pdb(
     result: Dict[str, object],
     chain_id: str = "A",
+    ligands: Optional[List[LigandAgent]] = None,
 ) -> str:
-    """Format minimizer result as PDB string (MODEL 1 ... ENDMDL END)."""
+    """Format minimizer result as PDB string (MODEL 1 ... ENDMDL END). Protein ATOM records then ligand HETATM if ligands provided."""
     backbone_atoms = result["backbone_atoms"]
     sequence = result["sequence"]
     include_sidechains = result.get("include_sidechains", False)
-    if not backbone_atoms:
+    if ligands is None:
+        ligands = result.get("ligands") or []
+    if not backbone_atoms and not ligands:
         return "MODEL     1\nENDMDL\nEND\n"
     lines = ["MODEL     1"]
     atom_id = 1
@@ -791,7 +858,6 @@ def full_chain_to_pdb(
     for res_id in range(1, n_res + 1):
         res_1 = sequence[res_id - 1]
         res_3 = AA_1to3.get(res_1, "UNK")
-        # Atoms per residue: N, CA, [CB], C, O
         n_atoms_this = (5 if res_1 != "G" else 4) if include_sidechains else 4
         for _ in range(n_atoms_this):
             name, xyz = backbone_atoms[idx]
@@ -801,6 +867,20 @@ def full_chain_to_pdb(
             )
             atom_id += 1
             idx += 1
+    def _pdb_coord(x: float) -> str:
+        s = f"{float(x):8.3f}"
+        return s[-8:] if len(s) > 8 else s
+
+    for res_id_het, lig in enumerate(ligands, start=1):
+        res_3 = (lig.res_name or "LIG")[:3]
+        for a, (name, xyz) in enumerate(zip(lig.atom_names, lig.get_world_positions())):
+            elem = (lig.elements[a] if a < len(lig.elements) else "C")[:2].rjust(2)
+            line = (
+                f"HETATM{atom_id:5d}  {name:2s}  {res_3:3s} {chain_id}{res_id_het:4d}    "
+                f"{_pdb_coord(xyz[0])}{_pdb_coord(xyz[1])}{_pdb_coord(xyz[2])}  1.00  0.00      {elem:>2s}"
+            )
+            lines.append(line[:80] if len(line) > 80 else line)
+            atom_id += 1
     lines.append("ENDMDL")
     lines.append("END")
     return "\n".join(lines)
