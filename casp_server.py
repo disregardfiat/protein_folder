@@ -138,34 +138,10 @@ def _move_to_outputs(job_id: str, pdb_content: str) -> None:
 
 def _move_to_outputs_assembly(
     job_id: str,
-    pdb_a: str,
-    pdb_b: str,
     pdb_complex: str,
 ) -> None:
-    """Write chain A, chain B, complex PDBs and a ZIP; move all to outputs/."""
-    _ensure_output_dirs()
-    for name, content in [
-        (f"{job_id}_chain_a.pdb", pdb_a),
-        (f"{job_id}_chain_b.pdb", pdb_b),
-        (f"{job_id}_complex.pdb", pdb_complex),
-    ]:
-        path = os.path.join(PENDING_DIR, name)
-        with open(path, "w") as f:
-            f.write(content)
-    zip_path = os.path.join(PENDING_DIR, f"{job_id}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("chain_a.pdb", pdb_a)
-        zf.writestr("chain_b.pdb", pdb_b)
-        zf.writestr("complex.pdb", pdb_complex)
-    to_move = [
-        f"{job_id}.txt", f"{job_id}.request.json",
-        f"{job_id}_chain_a.pdb", f"{job_id}_chain_b.pdb", f"{job_id}_complex.pdb", f"{job_id}.zip",
-    ]
-    for name in to_move:
-        src = os.path.join(PENDING_DIR, name)
-        dst = os.path.join(OUTPUTS_DIR, name)
-        if os.path.isfile(src):
-            shutil.move(src, dst)
+    """Write the single combined PDB (chain A + B) and move to outputs/. Same layout as single-chain: job_id.pdb."""
+    _move_to_outputs(job_id, pdb_complex)
 
 # Optional SMTP: send PDB to request's "email" address when set
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -256,50 +232,11 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
 
 def _send_assembly_email(
     to_email: str,
-    pdb_a: str,
-    pdb_b: str,
     pdb_complex: str,
     job_title: str | None,
 ) -> None:
-    """Send 2-chain assembly result as a ZIP (chain_a.pdb, chain_b.pdb, complex.pdb)."""
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        return
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("chain_a.pdb", pdb_a)
-        zf.writestr("chain_b.pdb", pdb_b)
-        zf.writestr("complex.pdb", pdb_complex)
-    buf.seek(0)
-    subject = f"HQIV assembly: {job_title}" if job_title else "HQIV 2-chain assembly (chain A, chain B, complex)"
-    msg = MIMEMultipart()
-    msg["Subject"] = subject
-    from_addr = _smtp_from_address()
-    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
-    msg["To"] = to_email
-    recipients = [to_email]
-    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
-        cc_addr = SMTP_CC_TO.strip().lower()
-        to_addr_lower = to_email.strip().lower()
-        if cc_addr != to_addr_lower:
-            msg["Cc"] = SMTP_CC_TO
-            recipients.append(SMTP_CC_TO)
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
-    msg.attach(MIMEText("2-chain assembly: chain_a.pdb, chain_b.pdb, complex.pdb (ZIP attached).", "plain"))
-    part = MIMEBase("application", "zip")
-    part.set_payload(buf.getvalue())
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", "attachment", filename="assembly.zip")
-    msg.attach(part)
-    try:
-        import smtplib
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
-            if SMTP_USE_TLS:
-                smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASSWORD)
-            smtp.sendmail(from_addr, recipients, msg.as_string())
-    except Exception as e:
-        app.logger.warning("SMTP assembly email failed: %s", e)
+    """Send the single combined PDB (chain A+B) as one attachment, same as single-chain."""
+    _send_pdb_email(to_email, pdb_complex, job_title or "2-chain assembly")
 
 
 def _send_job_failure_email(to_email: str, job_id: str, job_title: str | None, error_message: str) -> None:
@@ -476,9 +413,9 @@ def process_pending_jobs() -> None:
                     assembly = _predict_cartesian_assembly_with_complex(sequences)
                 if assembly is not None:
                     pdb_a, pdb_b, pdb_complex = assembly
-                    _move_to_outputs_assembly(job_id, pdb_a, pdb_b, pdb_complex)
+                    _move_to_outputs_assembly(job_id, pdb_complex)
                     if to_email:
-                        _send_assembly_email(to_email, pdb_a, pdb_b, pdb_complex, job_title)
+                        _send_assembly_email(to_email, pdb_complex, job_title)
                 else:
                     pdb = _predict_hke_assembly(seqs)
                     _move_to_outputs(job_id, pdb)
@@ -695,9 +632,9 @@ def _run_job_in_background(job_id: str) -> None:
                 assembly = _predict_cartesian_assembly_with_complex(sequences)
             if assembly is not None:
                 pdb_a, pdb_b, pdb_complex = assembly
-                _move_to_outputs_assembly(job_id, pdb_a, pdb_b, pdb_complex)
+                _move_to_outputs_assembly(job_id, pdb_complex)
                 if to_email:
-                    _send_assembly_email(to_email, pdb_a, pdb_b, pdb_complex, job_title)
+                    _send_assembly_email(to_email, pdb_complex, job_title)
             else:
                 pdb = _predict_hke_assembly(seqs)
                 _move_to_outputs(job_id, pdb)
