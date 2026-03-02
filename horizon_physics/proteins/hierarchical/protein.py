@@ -402,11 +402,13 @@ class Protein:
         funnel_radius: Optional[float] = None,
         funnel_stiffness: float = 1.0,
         funnel_radius_exit: Optional[float] = None,
+        converge_max_disp_ang: Optional[float] = None,
     ) -> Tuple[Any, dict]:
         """
         Staged optimization: (1) coarse rigid-body 6DOF + torsions, (2) internal torsions refinement,
         (3) optional final flat Cartesian refinement. Returns (positions (N,3), info dict).
         When funnel_radius is set, a soft cone confines group COMs in stages 1-2 (off in stage 3).
+        When converge_max_disp_ang is set, stage 3 stops when max Cα displacement per step < threshold.
         """
         from .minimize_hierarchical import run_staged_minimization
         return run_staged_minimization(
@@ -420,6 +422,7 @@ class Protein:
             funnel_radius=funnel_radius,
             funnel_stiffness=funnel_stiffness,
             funnel_radius_exit=funnel_radius_exit,
+            converge_max_disp_ang=converge_max_disp_ang,
         )
 
 

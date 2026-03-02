@@ -129,8 +129,12 @@ def _flat_cartesian_refinement(
     z_list: Any,
     max_iter: int = 100,
     gtol: float = 1e-5,
+    converge_max_disp_ang: Optional[float] = None,
+    n_res: Optional[int] = None,
 ) -> Tuple[Any, float]:
-    """Refine positions with existing grad_full (NumPy path)."""
+    """Refine positions with existing grad_full (NumPy path).
+    If converge_max_disp_ang and n_res are set, stop when max Cα displacement per step < threshold (0.5 Å per 100 res).
+    """
     from horizon_physics.proteins.folding_energy import e_tot_ca_with_bonds, grad_full
     import numpy as np
     pos = np.asarray(positions, dtype=np.float64).copy()
@@ -140,13 +144,26 @@ def _flat_cartesian_refinement(
     if np.any(bad):
         pos[bad] = 0.0
     z_np = np.asarray(z_list, dtype=np.int32).ravel()
+    if n_res is None:
+        n_res = pos.shape[0] // 4
     step = 0.02
     for it in range(max_iter):
         g = grad_full(pos, z_np, include_bonds=True, include_horizon=True, include_clash=True)
         g_norm = float(np.linalg.norm(g))
         if g_norm < gtol:
             break
+        pos_prev = pos.copy()
         pos = pos - step * g
+        if converge_max_disp_ang is not None and n_res is not None:
+            # Max displacement per residue (Cα only, same as complex minimizer)
+            max_disp = 0.0
+            for i in range(min(n_res, pos.shape[0] // 4)):
+                idx = 4 * i + 1
+                if idx < pos.shape[0]:
+                    d = float(np.linalg.norm(pos[idx] - pos_prev[idx]))
+                    max_disp = max(max_disp, d)
+            if max_disp < converge_max_disp_ang:
+                break
     e_final = float(e_tot_ca_with_bonds(pos, z_np))
     return pos, e_final
 
@@ -170,6 +187,7 @@ def run_staged_minimization(
     funnel_radius: Optional[float] = None,
     funnel_stiffness: float = 1.0,
     funnel_radius_exit: Optional[float] = None,
+    converge_max_disp_ang: Optional[float] = None,
 ) -> Tuple[Any, dict]:
     """
     Stage 1 (coarse): high inter-group COM attraction + compact init; minimize over all DOFs.
@@ -297,11 +315,14 @@ def run_staged_minimization(
                 protein.set_dofs(dofs)
                 _log_frame()
             info["stage2_iter"] = max_iter_stage2
-        # Stage 3: flat Cartesian refinement
+        # Stage 3: flat Cartesian refinement (same displacement tolerance as complex: 0.5 Å per 100 res)
         pos, z_list = protein.forward_kinematics()
         pos_np = _be.to_numpy(pos)
         z_np = _be.to_numpy(z_list)
-        pos_refined, e_final = _flat_cartesian_refinement(pos_np, z_np, max_iter=max_iter_stage3, gtol=gtol)
+        pos_refined, e_final = _flat_cartesian_refinement(
+            pos_np, z_np, max_iter=max_iter_stage3, gtol=gtol,
+            converge_max_disp_ang=converge_max_disp_ang, n_res=protein.n_res,
+        )
         # Trajectory is 6-DOF only (Stage 1+2); Stage 3 is Cartesian refinement, no extra frame
         info["e_final"] = e_final
         info["stage3_iter"] = max_iter_stage3
@@ -326,6 +347,7 @@ def minimize_full_chain_hierarchical(
     funnel_radius: Optional[float] = None,
     funnel_stiffness: float = 1.0,
     funnel_radius_exit: Optional[float] = None,
+    converge_max_disp_per_100_res: Optional[float] = 0.5,
 ) -> Tuple[Any, Any]:
     """
     Drop-in hierarchical minimizer. Returns (positions (N, 3), atom_types (N,) z_shell).
@@ -342,6 +364,8 @@ def minimize_full_chain_hierarchical(
         funnel_radius: Optional cone narrow-end radius (Å) for null-search bound in stages 1-2; None = off.
         funnel_stiffness: Soft-wall stiffness when funnel_radius is set.
         funnel_radius_exit: Cone exit radius (Å); default 2× funnel_radius. Set = funnel_radius for cylinder.
+        converge_max_disp_per_100_res: If set (default 0.5), stage-3 Cartesian refinement stops when
+            max Cα displacement per step < 0.5 * n_res/100 Å (same tolerance as complex minimizer).
 
     Returns:
         pos: (N, 3) NumPy array in Å (backbone N, CA, C, O per residue).
@@ -359,6 +383,8 @@ def minimize_full_chain_hierarchical(
         grouping_strategy=grouping_strategy,
         domain_ranges=domain_ranges,
     )
+    n_res = len(seq)
+    converge_ang = (converge_max_disp_per_100_res * n_res / 100.0) if converge_max_disp_per_100_res is not None else None
     positions, info = protein.minimize_hierarchical(
         max_iter_stage1=max_iter_stage1,
         max_iter_stage2=max_iter_stage2,
@@ -369,6 +395,7 @@ def minimize_full_chain_hierarchical(
         funnel_radius=funnel_radius,
         funnel_stiffness=funnel_stiffness,
         funnel_radius_exit=funnel_radius_exit,
+        converge_max_disp_ang=converge_ang,
     )
     # Get z_list from final state (same order as positions: N, CA, C, O per residue)
     _, z_list = protein.forward_kinematics()

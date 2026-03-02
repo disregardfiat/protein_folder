@@ -330,6 +330,41 @@ def build_bond_poles(
     return poles
 
 
+def build_bond_poles_segments(
+    positions: np.ndarray,
+    segment_ends: List[int],
+    r_eq: float = R_CA_CA_EQ,
+    r_min: float = R_BOND_MIN,
+    r_max: float = R_BOND_MAX,
+    k_bond: float = K_BOND,
+) -> List[Tuple[int, int, np.ndarray]]:
+    """
+    Bond poles only within segments. segment_ends = [n1, n2, ...] gives exclusive
+    end indices (chain 1: 0..n1-1, chain 2: n1..n2-1, ...). No bond between n1-1 and n1.
+    """
+    n = positions.shape[0]
+    poles: List[Tuple[int, int, np.ndarray]] = []
+    start = 0
+    for end in segment_ends:
+        end = min(end, n)
+        for i in range(start, end - 1):
+            j = i + 1
+            d = positions[j] - positions[i]
+            r = np.linalg.norm(d)
+            if r < 1e-12:
+                continue
+            u = d / r
+            if r < r_min:
+                g = -2 * k_bond * (r_min - r)
+            elif r > r_max:
+                g = 2 * k_bond * (r - r_max)
+            else:
+                g = 2 * k_bond * 0.1 * (r - r_eq)
+            poles.append(_pole(i, j, g * u))
+        start = end
+    return poles
+
+
 def grad_bonds_only(
     positions: np.ndarray,
     r_eq: float = R_CA_CA_EQ,

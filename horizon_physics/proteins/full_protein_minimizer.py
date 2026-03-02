@@ -806,6 +806,40 @@ def full_chain_to_pdb(
     return "\n".join(lines)
 
 
+def full_chain_to_pdb_complex(
+    backbone_a: List[Tuple[str, np.ndarray]],
+    backbone_b: List[Tuple[str, np.ndarray]],
+    sequence_a: str,
+    sequence_b: str,
+    chain_id_a: str = "A",
+    chain_id_b: str = "B",
+) -> str:
+    """Format two backbones as one PDB (MODEL 1) with chain A then chain B."""
+    lines = ["MODEL     1"]
+    atom_id = 1
+    for chain_idx, (backbone, sequence, chain_id) in enumerate([
+        (backbone_a, sequence_a, chain_id_a),
+        (backbone_b, sequence_b, chain_id_b),
+    ]):
+        n_res = len(sequence)
+        idx = 0
+        for res_id in range(1, n_res + 1):
+            res_1 = sequence[res_id - 1]
+            res_3 = AA_1to3.get(res_1, "UNK")
+            n_atoms_this = 4  # N, CA, C, O
+            for _ in range(n_atoms_this):
+                name, xyz = backbone[idx]
+                lines.append(
+                    f"ATOM  {atom_id:5d}  {name:2s}  {res_3:3s} {chain_id}{res_id:4d}    "
+                    f"{float(xyz[0]):8.3f}{float(xyz[1]):8.3f}{float(xyz[2]):8.3f}  1.00  0.00           "
+                )
+                atom_id += 1
+                idx += 1
+    lines.append("ENDMDL")
+    lines.append("END")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     import argparse
     import sys

@@ -10,6 +10,7 @@ Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import random
@@ -18,8 +19,11 @@ import shutil
 import sys
 import threading
 import time
+import zipfile
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from email.utils import formataddr, make_msgid, formatdate
 
 from flask import Flask, request, Response
@@ -31,11 +35,12 @@ if __name__ != "__main__":
         sys.path.insert(0, _root)
 
 from horizon_physics.proteins.casp_submission import _parse_fasta
-from horizon_physics.proteins import full_chain_to_pdb
+from horizon_physics.proteins import full_chain_to_pdb, full_chain_to_pdb_complex
 from horizon_physics.proteins.hierarchical import (
     minimize_full_chain_hierarchical,
     hierarchical_result_for_pdb,
 )
+from horizon_physics.proteins.assembly_dock import run_two_chain_assembly, run_two_chain_assembly_hke
 
 # Fast path (geometric-only, no minimization): for testing or when USE_FAST_PREDICT=1
 try:
@@ -109,6 +114,38 @@ def _move_to_outputs(job_id: str, pdb_content: str) -> None:
     with open(pdb_path, "w") as f:
         f.write(pdb_content)
     for name in (f"{job_id}.txt", f"{job_id}.pdb", f"{job_id}.request.json"):
+        src = os.path.join(PENDING_DIR, name)
+        dst = os.path.join(OUTPUTS_DIR, name)
+        if os.path.isfile(src):
+            shutil.move(src, dst)
+
+
+def _move_to_outputs_assembly(
+    job_id: str,
+    pdb_a: str,
+    pdb_b: str,
+    pdb_complex: str,
+) -> None:
+    """Write chain A, chain B, complex PDBs and a ZIP; move all to outputs/."""
+    _ensure_output_dirs()
+    for name, content in [
+        (f"{job_id}_chain_a.pdb", pdb_a),
+        (f"{job_id}_chain_b.pdb", pdb_b),
+        (f"{job_id}_complex.pdb", pdb_complex),
+    ]:
+        path = os.path.join(PENDING_DIR, name)
+        with open(path, "w") as f:
+            f.write(content)
+    zip_path = os.path.join(PENDING_DIR, f"{job_id}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("chain_a.pdb", pdb_a)
+        zf.writestr("chain_b.pdb", pdb_b)
+        zf.writestr("complex.pdb", pdb_complex)
+    to_move = [
+        f"{job_id}.txt", f"{job_id}.request.json",
+        f"{job_id}_chain_a.pdb", f"{job_id}_chain_b.pdb", f"{job_id}_complex.pdb", f"{job_id}.zip",
+    ]
+    for name in to_move:
         src = os.path.join(PENDING_DIR, name)
         dst = os.path.join(OUTPUTS_DIR, name)
         if os.path.isfile(src):
@@ -199,6 +236,54 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
             smtp.sendmail(from_addr, recipients, msg.as_string())
     except Exception as e:
         app.logger.warning("SMTP send failed: %s", e)
+
+
+def _send_assembly_email(
+    to_email: str,
+    pdb_a: str,
+    pdb_b: str,
+    pdb_complex: str,
+    job_title: str | None,
+) -> None:
+    """Send 2-chain assembly result as a ZIP (chain_a.pdb, chain_b.pdb, complex.pdb)."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        return
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("chain_a.pdb", pdb_a)
+        zf.writestr("chain_b.pdb", pdb_b)
+        zf.writestr("complex.pdb", pdb_complex)
+    buf.seek(0)
+    subject = f"HQIV assembly: {job_title}" if job_title else "HQIV 2-chain assembly (chain A, chain B, complex)"
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    from_addr = _smtp_from_address()
+    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
+    msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        to_addr_lower = to_email.strip().lower()
+        if cc_addr != to_addr_lower:
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
+    msg.attach(MIMEText("2-chain assembly: chain_a.pdb, chain_b.pdb, complex.pdb (ZIP attached).", "plain"))
+    part = MIMEBase("application", "zip")
+    part.set_payload(buf.getvalue())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename="assembly.zip")
+    msg.attach(part)
+    try:
+        import smtplib
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+    except Exception as e:
+        app.logger.warning("SMTP assembly email failed: %s", e)
 
 
 def _send_failure_email(to_email: str, job_id: str, job_title: str | None) -> None:
@@ -407,6 +492,43 @@ def _predict_hke_assembly(sequences: list[str]) -> str:
     return _merge_pdb_chains(results)
 
 
+def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, str] | None:
+    """
+    For exactly 2 chains: run each chain through HKE-with-funnel on its own thread;
+    map bond sites (placement); then run complex with HKE (no funnel) until
+    max displacement per residue < 0.5 Å. Returns (pdb_chain_a, pdb_chain_b, pdb_complex) or None if not 2 chains.
+    """
+    if len(sequences) != 2:
+        return None
+    seq_a = _sequence_from_input(sequences[0])
+    seq_b = _sequence_from_input(sequences[1])
+    if not seq_a or not seq_b:
+        return None
+    result_a, result_b, result_complex = run_two_chain_assembly_hke(
+        seq_a,
+        seq_b,
+        funnel_radius=FUNNEL_RADIUS,
+        funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+        funnel_stiffness=1.0,
+        hke_max_iter_s1=HKE_MAX_ITER[0],
+        hke_max_iter_s2=HKE_MAX_ITER[1],
+        hke_max_iter_s3=HKE_MAX_ITER[2],
+        converge_max_disp_per_100_res=0.5,
+        max_dock_iter=2000,
+    )
+    pdb_a = full_chain_to_pdb(result_a, chain_id="A")
+    pdb_b = full_chain_to_pdb(result_b, chain_id="B")
+    pdb_complex = full_chain_to_pdb_complex(
+        result_complex["backbone_chain_a"],
+        result_complex["backbone_chain_b"],
+        result_a["sequence"],
+        result_b["sequence"],
+        chain_id_a="A",
+        chain_id_b="B",
+    )
+    return (pdb_a, pdb_b, pdb_complex)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return Response("OK\n", status=200, mimetype="text/plain")
@@ -431,11 +553,26 @@ def _run_job_in_background(job_id: str) -> None:
     try:
         if USE_FAST_PREDICT and hqiv_predict_structure is not None:
             pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
+            _move_to_outputs(job_id, pdb)
+            if to_email:
+                _send_pdb_email(to_email, pdb, job_title)
+        elif len(seqs) == 2:
+            assembly = _predict_hke_assembly_with_complex(sequences)
+            if assembly is not None:
+                pdb_a, pdb_b, pdb_complex = assembly
+                _move_to_outputs_assembly(job_id, pdb_a, pdb_b, pdb_complex)
+                if to_email:
+                    _send_assembly_email(to_email, pdb_a, pdb_b, pdb_complex, job_title)
+            else:
+                pdb = _predict_hke_assembly(seqs)
+                _move_to_outputs(job_id, pdb)
+                if to_email:
+                    _send_pdb_email(to_email, pdb, job_title)
         else:
             pdb = _predict_hke_assembly(seqs) if len(seqs) > 1 else _predict_hke_single(seqs[0])
-        _move_to_outputs(job_id, pdb)
-        if to_email:
-            _send_pdb_email(to_email, pdb, job_title)
+            _move_to_outputs(job_id, pdb)
+            if to_email:
+                _send_pdb_email(to_email, pdb, job_title)
     except Exception as e:
         app.logger.warning("Background job %s failed: %s", job_id, e)
 

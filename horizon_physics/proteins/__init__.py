@@ -44,7 +44,7 @@ from .secondary_structure_predictor import (
     theta_eff_residue,
     preferred_basin_phi_psi,
 )
-from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb, pack_sidechains
+from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb, full_chain_to_pdb_complex, pack_sidechains
 from .grade_folds import ca_rmsd, load_ca_from_pdb, load_ca_and_sequence_from_pdb, kabsch_superpose
 
 # Optional hierarchical kinematic engine (parallel path)
@@ -96,6 +96,7 @@ __all__ = [
     "preferred_basin_phi_psi",
     "minimize_full_chain",
     "full_chain_to_pdb",
+    "full_chain_to_pdb_complex",
     "pack_sidechains",
     "ca_rmsd",
     "load_ca_from_pdb",

@@ -33,7 +33,7 @@ pip install "jax[tpu]"
 
 ### Co-translational ribosome tunnel (optional)
 
-Simulate the ribosome exit tunnel: null search cone, plane at the lip, fast-pass spaghetti (rigid group + bell-end translations), and a short HKE min pass on each connection. With `post_extrusion_refine=True` (default), the full HKE collapse/refine is run repeatedly after extrusion (no cone/plane) until two consecutive runs produce the same structure.
+Simulate the ribosome exit tunnel: null search cone, plane at the lip, **binary-tree** segment schedule (to damp vibrations), fast-pass spaghetti (rigid group + bell-end), and a short HKE min pass per segment. With `post_extrusion_refine=True` (default), the full HKE collapse/refine is run repeatedly after extrusion until no Cα moves more than 0.5 Å per 100 residues (adaptive).
 
 ```bash
 python -c "
@@ -47,6 +47,20 @@ result = minimize_full_chain(
 print(full_chain_to_pdb(result))
 "
 ```
+
+### Live trajectory visualizer
+
+When running the minimizer (or tunnel pipeline) with a trajectory log, you can watch Cα positions update in real time in a separate process:
+
+```bash
+# Terminal 1: run tunnel with trajectory log (writes JSONL)
+python -m horizon_physics.proteins.examples.run_tunnel_and_grade --targets T1037 --trajectory-log /tmp/t1037_traj.jsonl
+
+# Terminal 2: live 3D view (tails the log; requires matplotlib)
+python -m horizon_physics.proteins.examples.live_trajectory_viz /tmp/t1037_traj.jsonl
+```
+
+The visualizer runs in a separate process and tails the JSONL file, so it does not affect minimizer performance.
 
 ## Package
 
