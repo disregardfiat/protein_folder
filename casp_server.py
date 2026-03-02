@@ -253,13 +253,11 @@ def _send_job_failure_email(to_email: str, job_id: str, job_title: str | None, e
     msg["Subject"] = subject
     from_addr = _smtp_from_address()
     msg["From"] = formataddr(("HQIV CASP Server", from_addr))
-    msg["To"] = to_email
-    recipients = [to_email]
-    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
-        cc_addr = SMTP_CC_TO.strip().lower()
-        if cc_addr != to_email.strip().lower():
-            msg["Cc"] = SMTP_CC_TO
-            recipients.append(SMTP_CC_TO)
+    # Failure notices should go to the CC/monitoring address when configured,
+    # not to the requesting CASP address.
+    primary = SMTP_CC_TO or to_email
+    msg["To"] = primary
+    recipients = [primary]
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
     msg.attach(MIMEText(body, "plain"))
@@ -284,13 +282,10 @@ def _send_failure_email(to_email: str, job_id: str, job_title: str | None) -> No
     msg["Subject"] = subject
     from_addr = _smtp_from_address()
     msg["From"] = formataddr(("HQIV CASP Server", from_addr))
-    msg["To"] = to_email
-    recipients = [to_email]
-    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
-        cc_addr = SMTP_CC_TO.strip().lower()
-        if cc_addr != to_email.strip().lower():
-            msg["Cc"] = SMTP_CC_TO
-            recipients.append(SMTP_CC_TO)
+    # Final failure notifications: send to CC/monitoring address when available.
+    primary = SMTP_CC_TO or to_email
+    msg["To"] = primary
+    recipients = [primary]
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
     msg.attach(MIMEText(body, "plain"))
