@@ -50,6 +50,8 @@ def run_tunnel(
     sequence: str,
     label: str,
     quick: bool = False,
+    trajectory_log_path: str | None = None,
+    signal_dump_path: str | None = None,
 ) -> tuple[str, float, bool, float | None]:
     """Run co-translational tunnel pipeline; write *_minimized_tunnel.pdb. Returns (path, time_s, ok, E_ca_final)."""
     from horizon_physics.proteins import minimize_full_chain, full_chain_to_pdb
@@ -75,6 +77,8 @@ def run_tunnel(
             cone_half_angle_deg=12.0,
             lip_plane_distance=0.0,
             hke_above_tunnel_fraction=0.5,
+            trajectory_log_path=trajectory_log_path,
+            signal_dump_path=signal_dump_path,
         )
         pdb_str = full_chain_to_pdb(result)
         pdb_str = f"REMARK   {label} co-translational tunnel at {time.strftime('%Y-%m-%d %H:%M:%S')}\n{pdb_str}"
@@ -122,6 +126,8 @@ def main() -> None:
     parser.add_argument("--ref-names", type=str, default=None, help="Optional mapping label:file,label:file (e.g. crambin:1crn.pdb)")
     parser.add_argument("--score-against", type=str, choices=("cartesian", "hierarchical"), default=None, help="Score tunnel vs existing *_minimized_cartesian.pdb or *_minimized_hierarchical.pdb in examples/ (no ref-dir needed)")
     parser.add_argument("--no-resid", action="store_true", help="Align by residue order instead of residue ID when scoring")
+    parser.add_argument("--trajectory-log", type=str, default=None, metavar="PATH", help="Write JSONL trajectory to PATH for live_trajectory_viz (e.g. /tmp/t1037_traj.jsonl)")
+    parser.add_argument("--signal-dump", type=str, default=None, metavar="PATH", help="On Ctrl+C (or kill), write current Cα state to this PDB and exit (e.g. /tmp/t1037_dump.pdb)")
     args = parser.parse_args()
 
     ref_names_map: dict[str, str] = {}
@@ -144,13 +150,20 @@ def main() -> None:
     print("Co-translational tunnel pipeline (simulate_ribosome_tunnel=True)", flush=True)
     if args.quick:
         print("(quick mode: fewer steps)", flush=True)
+    if args.trajectory_log:
+        print(f"Trajectory log: {args.trajectory_log} (run: python -m horizon_physics.proteins.examples.live_trajectory_viz {args.trajectory_log})", flush=True)
     print("Outputs: examples/*_minimized_tunnel.pdb\n", flush=True)
 
     results = []
     for name, sequence, label in targets_to_run:
         n_res = len(sequence)
         print(f"=== {name} ({n_res} residues) ===", flush=True)
-        path, elapsed, ok, E_ca = run_tunnel(name, sequence, label, quick=args.quick)
+        path, elapsed, ok, E_ca = run_tunnel(
+            name, sequence, label,
+            quick=args.quick,
+            trajectory_log_path=args.trajectory_log,
+            signal_dump_path=args.signal_dump,
+        )
         rmsd_ang: float | None = None
         ref_path: str | None = None
         if ok:

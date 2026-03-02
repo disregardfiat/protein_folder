@@ -48,6 +48,40 @@ def load_ca_from_pdb(path: str) -> Tuple[np.ndarray, List[int]]:
     return np.array(ca_xyz, dtype=np.float64), res_ids
 
 
+# Three-letter to one-letter (for loading sequence from PDB)
+AA_3to1 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V",
+}
+
+
+def load_ca_and_sequence_from_pdb(path: str) -> Tuple[np.ndarray, str]:
+    """
+    Load Cα coordinates and one-letter sequence from a PDB file (from CA lines only).
+    Residue type from PDB column 17-20 (3-letter code). Unknown codes become 'X'.
+    Returns (ca_xyz (N, 3), sequence).
+    """
+    ca_xyz: List[Tuple[float, float, float]] = []
+    seq_list: List[str] = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("ATOM ") or line.startswith("HETATM"):
+                if line[12:16].strip() != "CA":
+                    continue
+                try:
+                    res_3 = line[17:20].strip().upper()
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    ca_xyz.append((x, y, z))
+                    seq_list.append(AA_3to1.get(res_3, "X"))
+                except (ValueError, IndexError):
+                    continue
+    return np.array(ca_xyz, dtype=np.float64), "".join(seq_list)
+
+
 def kabsch_superpose(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Find rotation R and translation t so that (R @ Q.T).T + t is best aligned to P (minimize RMSD).

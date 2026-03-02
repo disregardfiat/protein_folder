@@ -13,8 +13,10 @@ MIT License. Python 3.10+. Numpy only.
 from __future__ import annotations
 
 import json
+import signal
+import sys
 import numpy as np
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 def write_trajectory_frame(file_handle: Optional[Any], step: int, positions: np.ndarray) -> None:
@@ -74,6 +76,7 @@ def _minimize_bonds_fast(
     collapse_init_steps: int = 0,
     k_rg_collapse: Optional[float] = None,
     trajectory_log: Optional[Any] = None,
+    on_step_callback: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Fast minimization for long chains. Default: bonds + full vector-sum horizon (analytical).
@@ -96,6 +99,8 @@ def _minimize_bonds_fast(
     total_iter = 0
 
     write_trajectory_frame(trajectory_log, 0, pos)
+    if on_step_callback is not None:
+        on_step_callback(0, pos.copy())
 
     # Optional: compact init via Rg-only steps (pull toward COM while keeping bonds)
     if collapse and collapse_init_steps > 0:
@@ -109,6 +114,8 @@ def _minimize_bonds_fast(
             pos = _project_bonds(pos, r_min=r_min_loose, r_max=loose_r_max)
             total_iter += 1
             write_trajectory_frame(trajectory_log, total_iter, pos)
+            if on_step_callback is not None:
+                on_step_callback(total_iter, pos.copy())
 
     # Stage 1: collapse (loose bonds + Rg bias). Use bonds-only so horizon repulsion
     # doesn't oppose the Rg pull; allow r_min_loose so projection doesn't re-extend.
@@ -125,6 +132,8 @@ def _minimize_bonds_fast(
             pos = _project_bonds(pos, r_min=r_min_loose, r_max=loose_r_max)
             total_iter += 1
             write_trajectory_frame(trajectory_log, total_iter, pos)
+            if on_step_callback is not None:
+                on_step_callback(total_iter, pos.copy())
 
     # Stage 2: refine (tight bonds, no Rg); project into standard [2.5, 6] Å
     for it in range(n_refine):
@@ -141,6 +150,8 @@ def _minimize_bonds_fast(
         pos = _project_bonds(pos, r_min=r_min_tight, r_max=r_max_tight)
         total_iter += 1
         write_trajectory_frame(trajectory_log, total_iter, pos)
+        if on_step_callback is not None:
+            on_step_callback(total_iter, pos.copy())
 
     z = np.full(n, 6)
     e_final = float(e_tot_ca_with_bonds(pos, z))
@@ -204,6 +215,7 @@ def minimize_full_chain(
     collapse_init_steps: Optional[int] = None,
     k_rg_collapse: Optional[float] = None,
     trajectory_log_path: Optional[str] = None,
+    signal_dump_path: Optional[str] = None,
     simulate_ribosome_tunnel: bool = False,
     tunnel_length: float = 25.0,
     cone_half_angle_deg: float = 12.0,
@@ -230,11 +242,12 @@ def minimize_full_chain(
         collapse_init_steps: Optional Rg-only steps before main loop to get compact init (default 40 when collapse=True).
         k_rg_collapse: Weight for Rg² term during collapse (default K_RG_COLLAPSE). Increase for stronger pull toward compact.
         trajectory_log_path: If set, write each step's Cα positions to this file as JSONL (one {"t": step, "positions": [...]} per line, flush each line) for Manim or other viewers; use with `tail -f` to watch the run.
+        signal_dump_path: If set, on SIGINT/SIGTERM (e.g. Ctrl+C) write the current Cα state to this path as a PDB and exit. Lets you recover a partial run.
         simulate_ribosome_tunnel: If True, use co-translational mode: null search cone (exit tunnel), plane at lip to null unphysical re-entry, fast-pass spaghetti (rigid group + bell-end large translations), and a short HKE min pass on each connection event. Default False for backward compatibility.
         tunnel_length: Length of tunnel in Å along extrusion axis (default 25.0). Residues with Cα inside this segment are cone-constrained.
         cone_half_angle_deg: Half-angle of the cone in degrees (default 12.0). Cα inside the tunnel must stay within this cone from the peptidyl transferase center.
         lip_plane_distance: Extra distance in Å beyond tunnel_length for the lip plane (default 0.0). Lip is at tunnel_length + lip_plane_distance along the axis.
-        post_extrusion_refine: When simulate_ribosome_tunnel=True, if True (default), run a final full HKE collapse/refine stage once the full chain is extruded: cone/plane constraints are removed and the existing two-stage logic (Rg-pull + horizon refine) is applied repeatedly until no Cα moved more than 0.5 Å between runs.
+        post_extrusion_refine: When simulate_ribosome_tunnel=True, if True (default), run a final full HKE collapse/refine stage once the full chain is extruded: cone/plane constraints are removed and the existing two-stage logic (Rg-pull + horizon refine) is applied repeatedly until no Cα moved more than 0.5 Å per 100 residues between runs (adaptive threshold).
         tunnel_axis: (3,) unit vector for tunnel axis; default +Z. Chain is aligned so N-terminus is at origin and extrusion is along this axis.
         hke_above_tunnel_fraction: When simulate_ribosome_tunnel=True, HKE (connection-triggered L-BFGS) is applied only to residues above this fraction of the tunnel length (default 0.5 = 50%). The chain is built with the fast method (rigid group + bell-end); only the part above this threshold is updated by the min pass.
 
@@ -280,6 +293,43 @@ def minimize_full_chain(
     traj_file = None
     if trajectory_log_path:
         traj_file = open(trajectory_log_path, "w")
+    # Mutable ref for signal dump: updated each step so Ctrl+C writes latest state to PDB
+    current_for_dump: Dict[str, Any] = {"ca": ca_init.copy(), "sequence": seq}
+
+    def _do_signal_dump(exit_after: bool = True) -> None:
+        if signal_dump_path is None or current_for_dump["ca"] is None:
+            return
+        ca = current_for_dump["ca"]
+        seq_d = current_for_dump["sequence"]
+        if len(seq_d) == 0 or ca.shape[0] != len(seq_d):
+            return
+        try:
+            backbone_atoms = _place_full_backbone(ca, seq_d)
+            result = {
+                "ca_min": ca,
+                "backbone_atoms": backbone_atoms,
+                "sequence": seq_d,
+                "n_res": len(seq_d),
+            }
+            pdb_str = full_chain_to_pdb(result)
+            with open(signal_dump_path, "w") as f:
+                f.write(pdb_str)
+            sys.stderr.write(f"Signal dump: wrote current state to {signal_dump_path}\n")
+        except Exception as e:
+            sys.stderr.write(f"Signal dump failed: {e}\n")
+        if exit_after:
+            sys.exit(0)
+
+    if signal_dump_path:
+        def _handler_exit(_signum: int, _frame: Any) -> None:
+            _do_signal_dump(exit_after=True)
+        def _handler_dump_only(_signum: int, _frame: Any) -> None:
+            _do_signal_dump(exit_after=False)
+        signal.signal(signal.SIGINT, _handler_exit)
+        signal.signal(signal.SIGTERM, _handler_exit)
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, _handler_dump_only)
+
     try:
         # Co-translational ribosome tunnel mode: cone + lip plane, fast-pass spaghetti, connection-triggered HKE
         if simulate_ribosome_tunnel:
@@ -303,10 +353,13 @@ def minimize_full_chain(
                 r_bond_max=6.0,
                 hke_above_tunnel_fraction=hke_above_tunnel_fraction,
             )
+            current_for_dump["ca"] = ca_min.copy()
             # Post-extrusion refinement: full HKE two-stage (no cone/plane), repeat until no atom moved > post_extrusion_max_disp
             if post_extrusion_refine:
                 total_refine_iter = 0
-                post_extrusion_max_disp = 0.5  # Å; run again if any Cα moved more than this
+                post_extrusion_max_disp = 0.5 * (n_res / 100.0)  # Å; adaptive: 0.5 Å per 100 residues
+                def _update_dump(_step: int, pos: np.ndarray) -> None:
+                    current_for_dump["ca"] = pos.copy()
                 while True:
                     ca_prev = ca_min.copy()
                     ca_min, info_refine = _minimize_bonds_fast(
@@ -320,7 +373,9 @@ def minimize_full_chain(
                         collapse_init_steps=init_steps,
                         k_rg_collapse=k_rg_collapse,
                         trajectory_log=traj_file,
+                        on_step_callback=_update_dump,
                     )
+                    current_for_dump["ca"] = ca_min.copy()
                     total_refine_iter += info_refine.get("n_iter", 0)
                     max_disp = np.max(np.linalg.norm(ca_min - ca_prev, axis=1))
                     if max_disp <= post_extrusion_max_disp:
@@ -334,6 +389,8 @@ def minimize_full_chain(
                 write_trajectory_frame(traj_file, 0, ca_min)
         # Standard HKE path (unchanged): fast path for long chains or L-BFGS for short
         elif n_res > 50:
+            def _update_dump_long(_step: int, pos: np.ndarray) -> None:
+                current_for_dump["ca"] = pos.copy()
             ca_min, info = _minimize_bonds_fast(
                 ca_init,
                 z_ca,
@@ -344,6 +401,7 @@ def minimize_full_chain(
                 collapse_init_steps=init_steps if collapse else 0,
                 k_rg_collapse=k_rg_collapse,
                 trajectory_log=traj_file,
+                on_step_callback=_update_dump_long if signal_dump_path else None,
             )
         else:
             def _traj_cb(step: int, pos: np.ndarray) -> None:

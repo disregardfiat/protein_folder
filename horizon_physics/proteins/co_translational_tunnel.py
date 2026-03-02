@@ -328,6 +328,118 @@ def align_chain_to_tunnel(
     return out
 
 
+def _segment_pass(
+    pos: np.ndarray,
+    z_list: np.ndarray,
+    i: int,
+    j: int,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    tunnel_length: float,
+    cone_half_angle_deg: float,
+    lip_plane_distance: float,
+    grad_func,
+    project_bonds,
+    fast_pass_steps_per_connection: int,
+    min_pass_iter_per_connection: int,
+    r_bond_min: float,
+    r_bond_max: float,
+    hke_above_tunnel_fraction: float,
+) -> int:
+    """Run one fast-pass + min pass on segment pos[i:j]. Bell = junction (or both if L==2). Returns n_iter."""
+    L = j - i
+    if L <= 1:
+        return 0
+    pos_seg = pos[i:j].copy()
+    z_seg = z_list[i:j]
+    mid_seg = L // 2
+    if L == 2:
+        bell_seg = [0, 1]
+    else:
+        bell_seg = [mid_seg - 1, mid_seg]
+    rigid_seg = [idx for idx in range(L) if idx not in bell_seg]
+
+    for _ in range(fast_pass_steps_per_connection):
+        grad = grad_func(pos_seg, z_seg)
+        apply_cone_and_plane_masking(
+            grad, pos_seg, ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance
+        )
+        rigid_body_gradient_for_group(pos_seg, grad, rigid_seg)
+        g_norm = np.linalg.norm(grad)
+        if g_norm < 1e-6:
+            break
+        step = 0.3 / (g_norm + 1e-9)
+        pos_seg = pos_seg - step * grad
+        pos_seg = project_bonds(pos_seg, r_min=r_bond_min, r_max=r_bond_max)
+
+    pos_seg, n_iter = run_masked_lbfgs_pass(
+        pos_seg,
+        z_seg,
+        ptc_origin,
+        axis,
+        tunnel_length,
+        cone_half_angle_deg,
+        lip_plane_distance,
+        max_iter=min_pass_iter_per_connection,
+        grad_func=grad_func,
+        project_bonds=project_bonds,
+        r_bond_min=r_bond_min,
+        r_bond_max=r_bond_max,
+        hke_above_tunnel_fraction=hke_above_tunnel_fraction,
+    )
+    pos[i:j] = pos_seg
+    return n_iter
+
+
+def _binary_tree_minimize(
+    pos: np.ndarray,
+    z_list: np.ndarray,
+    i: int,
+    j: int,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    tunnel_length: float,
+    cone_half_angle_deg: float,
+    lip_plane_distance: float,
+    grad_func,
+    project_bonds,
+    fast_pass_steps_per_connection: int,
+    min_pass_iter_per_connection: int,
+    r_bond_min: float,
+    r_bond_max: float,
+    hke_above_tunnel_fraction: float,
+) -> int:
+    """Process segment [i:j] in binary-tree order: recurse on halves then relax junction. Returns total n_iter."""
+    L = j - i
+    if L <= 1:
+        return 0
+    total = 0
+    if L > 2:
+        mid = i + L // 2
+        total += _binary_tree_minimize(
+            pos, z_list, i, mid,
+            ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance,
+            grad_func, project_bonds,
+            fast_pass_steps_per_connection, min_pass_iter_per_connection,
+            r_bond_min, r_bond_max, hke_above_tunnel_fraction,
+        )
+        total += _binary_tree_minimize(
+            pos, z_list, mid, j,
+            ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance,
+            grad_func, project_bonds,
+            fast_pass_steps_per_connection, min_pass_iter_per_connection,
+            r_bond_min, r_bond_max, hke_above_tunnel_fraction,
+        )
+    total += _segment_pass(
+        pos, z_list, i, j,
+        ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance,
+        grad_func, project_bonds,
+        fast_pass_steps_per_connection, min_pass_iter_per_connection,
+        r_bond_min, r_bond_max, hke_above_tunnel_fraction,
+    )
+    return total
+
+
 def co_translational_minimize(
     ca_init: np.ndarray,
     z_list: np.ndarray,
@@ -346,13 +458,11 @@ def co_translational_minimize(
     hke_above_tunnel_fraction: float = 0.5,
 ) -> Tuple[np.ndarray, dict]:
     """
-    Co-translational minimization: fast method to build the chain (rigid group +
-    bell-end only, no per-residue HKE inside the tunnel), then connection-triggered
-    HKE min pass at each chain length. HKE is applied only above hke_above_tunnel_fraction
-    of the tunnel (default 0.5 = 50%): residues below that have gradient zeroed in the
-    L-BFGS pass. Chain is built along the tunnel; at each length k we run a fast-pass
-    (gradient masked with cone/plane, non-bell replaced by rigid-body gradient) for a
-    few steps, then one short masked L-BFGS pass (connection event). Returns (ca_min, info).
+    Co-translational minimization: binary-tree schedule (instead of running down the chain
+    N→C) to damp vibrations that hurt convergence. Process segments in divide-and-conquer
+    order: optimize pairs, then merge at junctions (bell at junction, rigid elsewhere), then
+    larger segments. Same physics: cone/plane, rigid group + bell, connection-triggered
+    HKE min pass per segment. Returns (ca_min, info).
     Post-extrusion refinement (full HKE two-stage with no cone/plane) is not done here;
     the caller (minimize_full_chain) runs it when post_extrusion_refine=True.
     """
@@ -360,50 +470,24 @@ def co_translational_minimize(
 
     pos = align_chain_to_tunnel(ca_init, ptc_origin, axis)
     n = pos.shape[0]
-    lip_distance = tunnel_length + lip_plane_distance
-    total_min_steps = 0
-
-    for k in range(2, n + 1):
-        pos_k = pos[:k].copy()
-        z_k = z_list[:k]
-        inside = inside_tunnel_mask(pos_k, ptc_origin, axis, tunnel_length)
-        past_lip = past_lip_mask(pos_k, ptc_origin, axis, lip_distance)
-        bell = set(bell_end_indices(k, n_bell))
-        # Rigid group = all except bell-end (inside tunnel + spaghetti move as one)
-        rigid_indices = [i for i in range(k) if i not in bell]
-
-        # Fast-pass: a few gradient steps with cone/plane + rigid group
-        for _ in range(fast_pass_steps_per_connection):
-            grad = grad_func(pos_k, z_k)
-            apply_cone_and_plane_masking(
-                grad, pos_k, ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance
-            )
-            rigid_body_gradient_for_group(pos_k, grad, rigid_indices)
-            g_norm = np.linalg.norm(grad)
-            if g_norm < 1e-6:
-                break
-            step = 0.3 / (g_norm + 1e-9)
-            pos_k = pos_k - step * grad
-            pos_k = project_bonds(pos_k, r_min=r_bond_min, r_max=r_bond_max)
-
-        # Connection-triggered min pass (short HKE with cone/plane; HKE only above fraction of tunnel)
-        pos_k, n_iter = run_masked_lbfgs_pass(
-            pos_k,
-            z_k,
-            ptc_origin,
-            axis,
-            tunnel_length,
-            cone_half_angle_deg,
-            lip_plane_distance,
-            max_iter=min_pass_iter_per_connection,
-            grad_func=grad_func,
-            project_bonds=project_bonds,
-            r_bond_min=r_bond_min,
-            r_bond_max=r_bond_max,
-            hke_above_tunnel_fraction=hke_above_tunnel_fraction,
-        )
-        total_min_steps += n_iter
-        pos[:k] = pos_k
+    total_min_steps = _binary_tree_minimize(
+        pos,
+        z_list,
+        0,
+        n,
+        ptc_origin,
+        axis,
+        tunnel_length,
+        cone_half_angle_deg,
+        lip_plane_distance,
+        grad_func,
+        project_bonds,
+        fast_pass_steps_per_connection,
+        min_pass_iter_per_connection,
+        r_bond_min,
+        r_bond_max,
+        hke_above_tunnel_fraction,
+    )
 
     e_final = float(e_tot_ca_with_bonds(pos, z_list))
     info = {
@@ -411,6 +495,6 @@ def co_translational_minimize(
         "e_initial": e_final,
         "n_iter": total_min_steps,
         "success": True,
-        "message": "Co-translational tunnel (fast-pass + connection-triggered HKE)",
+        "message": "Co-translational tunnel (binary-tree fast-pass + connection-triggered HKE)",
     }
     return pos, info

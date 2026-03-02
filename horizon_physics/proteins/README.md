@@ -120,20 +120,49 @@ pdb_str = full_chain_to_pdb(result, chain_id="A")
 - **Side-chain pack:** If `include_sidechains=True`, rotamer packing runs after backbone: χ1 from `side_chain_chi_preferences()` (grid pref±120°, ±60°, 0°) then 5 L-BFGS steps on χ1 to minimize clash energy. Disable with `side_chain_pack=False`. Optional standalone: `pack_sidechains(result)`.
 - **Quick mode:** `minimize_full_chain(..., quick=True)` disables side chains, uses fewer iterations and relaxed gtol, and bonds-only gradient for rapid prototyping.
 - **Long-chain collapse:** For n_res > 50, `collapse=True` (default) runs two-stage annealing (Rg collapse then refine). Tune with `long_chain_max_iter` (default 250), `collapse_init_steps` (default 40), or `k_rg_collapse` to strengthen the Rg pull. Set `collapse=False` to skip and use the original single-stage path.
-- **Co-translational ribosome tunnel:** `simulate_ribosome_tunnel=True` (default `False`) enables a physics-first co-translational mode: a null search cone (exit tunnel, `cone_half_angle_deg=12`, `tunnel_length=25` Å), a plane at the tunnel lip to null unphysical re-entry (`lip_plane_distance=0`), fast-pass spaghetti building (rigid-group 6-DOF + bell-end large translations only), and one short HKE minimization pass on each connection event. With `post_extrusion_refine=True` (default), once the full chain is extruded the full HKE two-stage collapse/refine is run repeatedly until two consecutive runs produce the same structure (cone/plane removed; same two-stage Rg + horizon as the standard long-chain path). The chain is aligned with the tunnel axis (default +Z; override with `tunnel_axis`). See `horizon_physics/proteins/co_translational_tunnel.py` and unit tests in `test_co_translational_tunnel.py`.
+- **Co-translational ribosome tunnel:** `simulate_ribosome_tunnel=True` (default `False`) enables a physics-first co-translational mode: **binary-tree segment schedule** (instead of N→C run down the chain, to damp vibrations and improve convergence), null search cone (exit tunnel, `cone_half_angle_deg=12`, `tunnel_length=25` Å), plane at the tunnel lip, fast-pass spaghetti (rigid-group 6-DOF + bell at junction), and one short HKE min pass per segment. With `post_extrusion_refine=True` (default), once the full chain is extruded the full HKE two-stage collapse/refine is run **repeatedly until no Cα moves more than 0.5 Å per 100 residues between runs** (adaptive) (no fixed round cap). Cone/plane removed during post-extrusion. Tunnel axis default +Z; override with `tunnel_axis`. See `co_translational_tunnel.py` and `test_co_translational_tunnel.py`.
 
 ### Co-translational Mode (Ribosome Tunnel Simulation)
 
 When `simulate_ribosome_tunnel=True`, the minimizer builds the chain co-translationally with these steps:
 
-1. **Null search cone:** Residues whose Cα is still inside the tunnel (N-terminal segment up to `tunnel_length` Å) must stay inside a conical volume. Any gradient component that would push a Cα outside the cone is projected back (zeroed outward radial component).
-2. **Plane at tunnel lip:** A hard plane perpendicular to the tunnel axis at the lip. Gradient components that would move residues back across the plane (unphysical re-entry) are nullified.
-3. **Fast-pass spaghetti:** While growing the chain, the already-extruded portion is treated as a rigid/semi-rigid body (6-DOF group rotation + translation). Only the newest residue(s) at the bell end are optimized with large translations.
-4. **Bell-end only large translations:** Once a residue has exited the lip, its local search is restricted to large translations + group motion with the extruded spaghetti.
-5. **Min pass on connection:** When a new residue fully emerges, one short HKE minimization pass is run on the entire extruded portion with cone/plane still active (and optionally only the segment above `hke_above_tunnel_fraction` of the tunnel updated).
-6. **Post-extrusion refinement** (if `post_extrusion_refine=True`): Once the full chain is extruded, cone/plane constraints are removed and the full HKE two-stage collapse/refine is run repeatedly until two consecutive runs produce the same structure (within 1e-6 Å).
+1. **Binary-tree schedule:** Segments are processed in divide-and-conquer order (pairs, then merge at junctions, then larger segments) instead of running down the chain N→C. This damps vibrations that would otherwise hurt convergence. At each segment, the bell (residues allowed to move freely) is at the junction; the rest move as a rigid group.
+2. **Null search cone:** Residues whose Cα is still inside the tunnel (N-terminal segment up to `tunnel_length` Å) must stay inside a conical volume. Any gradient component that would push a Cα outside the cone is projected back (zeroed outward radial component).
+3. **Plane at tunnel lip:** A hard plane perpendicular to the tunnel axis at the lip. Gradient components that would move residues back across the plane (unphysical re-entry) are nullified.
+4. **Fast-pass spaghetti:** The already-extruded portion is treated as a rigid/semi-rigid body (6-DOF group rotation + translation); only the bell (e.g. junction or newest residues) is optimized with large translations.
+5. **Min pass on connection:** When a segment is merged or a new residue emerges, one short HKE minimization pass is run on that segment with cone/plane still active (and optionally only the part above `hke_above_tunnel_fraction` of the tunnel updated).
+6. **Post-extrusion refinement** (if `post_extrusion_refine=True`): Once the full chain is extruded, cone/plane constraints are removed and the full HKE two-stage collapse/refine is run repeatedly until **no Cα moved more than 0.5 Å per 100 residues between runs** (adaptive) (no round limit).
 
-Edge cases: short chains (n_res &lt; tunnel_length) are handled by the same loop (all residues may stay inside cone). Prolines and signal peptides use the same cone/plane and bond projection; no special branching.
+Edge cases: short chains (n_res &lt; tunnel_length) are handled by the same loop. Prolines and signal peptides use the same cone/plane and bond projection; no special branching.
+
+### Live trajectory visualizer
+
+When the minimizer is run with `trajectory_log_path` set (or `run_tunnel_and_grade --trajectory-log PATH`), it writes a JSONL file (one `{"t": step, "positions": [[x,y,z], ...]}` per line, flushed each frame). A **live visualizer** tails this file in a separate process and updates a 3D matplotlib view (Cα scatter + bonds) in real time, without affecting minimizer performance:
+
+```bash
+# Terminal 1
+python -m horizon_physics.proteins.examples.run_tunnel_and_grade --targets T1037 --trajectory-log /tmp/traj.jsonl
+
+# Terminal 2 (requires matplotlib)
+python -m horizon_physics.proteins.examples.live_trajectory_viz /tmp/traj.jsonl
+```
+
+See `examples/live_trajectory_viz.py` for options (`--no-bonds`, `--update-ms`).
+
+### Signal dump on kill
+
+When `signal_dump_path` is set (or `run_tunnel_and_grade --signal-dump PATH`), the minimizer registers SIGINT/SIGTERM handlers. On Ctrl+C (or `kill`), it writes the **current** Cα state to that path as a PDB and exits. Lets you recover a partial run without losing progress. The dump is updated each refinement step (tunnel post-extrusion and long-chain path).
+
+### Run minimizer from a PDB (troubleshooting)
+
+To refine or troubleshoot an existing structure, load Cα and sequence from a PDB and run the minimizer:
+
+```bash
+python -m horizon_physics.proteins.examples.run_minimizer_on_pdb model.pdb -o refined.pdb
+python -m horizon_physics.proteins.examples.run_minimizer_on_pdb model.pdb -o out.pdb --tunnel --signal-dump /tmp/dump.pdb
+```
+
+Sequence is read from PDB residue names (3-letter → 1-letter). Use `load_ca_and_sequence_from_pdb(path)` in code for the same (returns `(ca_xyz, sequence)`).
 
 ### Current algorithm (full-chain pipeline)
 

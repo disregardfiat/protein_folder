@@ -45,7 +45,7 @@ from .secondary_structure_predictor import (
     preferred_basin_phi_psi,
 )
 from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb, pack_sidechains
-from .grade_folds import ca_rmsd, load_ca_from_pdb, kabsch_superpose
+from .grade_folds import ca_rmsd, load_ca_from_pdb, load_ca_and_sequence_from_pdb, kabsch_superpose
 
 # Optional hierarchical kinematic engine (parallel path)
 try:
@@ -99,6 +99,7 @@ __all__ = [
     "pack_sidechains",
     "ca_rmsd",
     "load_ca_from_pdb",
+    "load_ca_and_sequence_from_pdb",
     "kabsch_superpose",
     "minimize_full_chain_hierarchical",
     "grade_trajectory",
