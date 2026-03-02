@@ -480,3 +480,17 @@ def run_two_chain_assembly(
         "info": info,
     }
     return result_a, result_b, result_complex
+
+
+def complex_to_single_chain_result(result_complex: dict) -> dict:
+    """
+    Turn a two-chain complex result into a single result dict that can be passed
+    as the first argument to run_two_chain_assembly for (A+B)+C docking.
+    """
+    backbone = result_complex["backbone_chain_a"] + result_complex["backbone_chain_b"]
+    return {
+        "ca_min": result_complex["ca_min"],
+        "backbone_atoms": backbone,
+        "sequence": result_complex["sequence"],
+        "n_res": result_complex["n_res"],
+    }

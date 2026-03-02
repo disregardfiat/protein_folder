@@ -45,7 +45,11 @@ from horizon_physics.proteins.hierarchical import (
     minimize_full_chain_hierarchical,
     hierarchical_result_for_pdb,
 )
-from horizon_physics.proteins.assembly_dock import run_two_chain_assembly, run_two_chain_assembly_hke
+from horizon_physics.proteins.assembly_dock import (
+    run_two_chain_assembly,
+    run_two_chain_assembly_hke,
+    complex_to_single_chain_result,
+)
 
 # Fast path (geometric-only, no minimization): for testing or when USE_FAST_PREDICT=1
 try:
@@ -422,11 +426,12 @@ def process_pending_jobs() -> None:
                     if to_email:
                         _send_pdb_email(to_email, pdb, job_title)
             else:
-                pdb = (
-                    _predict_hke_assembly(seqs)
-                    if len(seqs) > 1
-                    else _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
-                )
+                if len(seqs) >= 3:
+                    pdb = _predict_hke_assembly_multichain(sequences)
+                elif len(seqs) > 1:
+                    pdb = _predict_hke_assembly(seqs)
+                else:
+                    pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
                 _move_to_outputs(job_id, pdb)
                 if to_email:
                     _send_pdb_email(to_email, pdb, job_title)
@@ -498,7 +503,7 @@ def _merge_pdb_chains(result_and_chain_ids: list[tuple[dict, str]]) -> str:
 
 
 def _predict_hke_assembly(sequences: list[str]) -> str:
-    """Run HKE + funnel per chain; return one PDB with chain A, B, C, ...."""
+    """Run HKE + funnel per chain; return one PDB with chain A, B, C, .... (no docking)."""
     chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     results = []
     for i, seq in enumerate(sequences):
@@ -516,6 +521,83 @@ def _predict_hke_assembly(sequences: list[str]) -> str:
         cid = chain_ids[i] if i < len(chain_ids) else "A"
         results.append((result, cid))
     return _merge_pdb_chains(results)
+
+
+def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
+    """
+    Multi-chain with (A+B)+C docking: fold A, fold B, dock A+B; then fold C, dock (A+B)+C;
+    repeat for further chains. Returns single PDB with chain A, B, C, ...
+    """
+    chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    seqs = [_sequence_from_input(s) for s in sequences]
+    seqs = [s for s in seqs if s]
+    if not seqs:
+        return "MODEL     1\nENDMDL\nEND\n"
+    if len(seqs) == 1:
+        return _predict_hke_single(seqs[0], ligands=None)
+    if len(seqs) == 2:
+        assembly = _predict_hke_assembly_with_complex(sequences)
+        if assembly is not None:
+            return assembly[2]
+        return _predict_hke_assembly(sequences)
+    # (A+B)+C pipeline
+    result_a, result_b, result_ab = run_two_chain_assembly_hke(
+        seqs[0],
+        seqs[1],
+        funnel_radius=FUNNEL_RADIUS,
+        funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+        funnel_stiffness=1.0,
+        hke_max_iter_s1=HKE_MAX_ITER[0],
+        hke_max_iter_s2=HKE_MAX_ITER[1],
+        hke_max_iter_s3=HKE_MAX_ITER[2],
+        converge_max_disp_per_100_res=0.5,
+        max_dock_iter=2000,
+    )
+    chain_lengths = [len(seqs[0]), len(seqs[1])]
+    for i in range(2, len(seqs)):
+        result_combined = complex_to_single_chain_result(result_ab)
+        pos, z_list = minimize_full_chain_hierarchical(
+            seqs[i],
+            include_sidechains=False,
+            funnel_radius=FUNNEL_RADIUS,
+            funnel_stiffness=1.0,
+            funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+            max_iter_stage1=HKE_MAX_ITER[0],
+            max_iter_stage2=HKE_MAX_ITER[1],
+            max_iter_stage3=HKE_MAX_ITER[2],
+        )
+        result_c = hierarchical_result_for_pdb(pos, z_list, seqs[i], include_sidechains=False)
+        _, _, result_ab = run_two_chain_assembly(
+            result_combined,
+            result_c,
+            max_dock_iter=2000,
+            converge_max_disp_per_100_res=0.5,
+        )
+        chain_lengths.append(len(seqs[i]))
+    # Split result_ab: backbone_chain_a = all but last chain, backbone_chain_b = last chain
+    bb_a = result_ab["backbone_chain_a"]
+    bb_b = result_ab["backbone_chain_b"]
+    n_prev = sum(chain_lengths[:-1])
+    atoms_per_res = 4
+    results = []
+    offset = 0
+    for j, n_res in enumerate(chain_lengths[:-1]):
+        n_atoms = n_res * atoms_per_res
+        results.append({
+            "backbone_atoms": bb_a[offset : offset + n_atoms],
+            "sequence": seqs[j],
+            "n_res": n_res,
+        })
+        offset += n_atoms
+    results.append({
+        "backbone_atoms": bb_b,
+        "sequence": seqs[-1],
+        "n_res": chain_lengths[-1],
+    })
+    return _merge_pdb_chains([
+        (results[j], chain_ids[j] if j < len(chain_ids) else "A")
+        for j in range(len(results))
+    ])
 
 
 def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, str] | None:
@@ -641,11 +723,12 @@ def _run_job_in_background(job_id: str) -> None:
                 if to_email:
                     _send_pdb_email(to_email, pdb, job_title)
         else:
-            pdb = (
-                _predict_hke_assembly(seqs)
-                if len(seqs) > 1
-                else _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
-            )
+            if len(seqs) >= 3:
+                pdb = _predict_hke_assembly_multichain(sequences)
+            elif len(seqs) > 1:
+                pdb = _predict_hke_assembly(seqs)
+            else:
+                pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
             _move_to_outputs(job_id, pdb)
             if to_email:
                 _send_pdb_email(to_email, pdb, job_title)
