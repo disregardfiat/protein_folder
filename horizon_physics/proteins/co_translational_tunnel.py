@@ -353,6 +353,8 @@ def co_translational_minimize(
     L-BFGS pass. Chain is built along the tunnel; at each length k we run a fast-pass
     (gradient masked with cone/plane, non-bell replaced by rigid-body gradient) for a
     few steps, then one short masked L-BFGS pass (connection event). Returns (ca_min, info).
+    Post-extrusion refinement (full HKE two-stage with no cone/plane) is not done here;
+    the caller (minimize_full_chain) runs it when post_extrusion_refine=True.
     """
     from .folding_energy import e_tot_ca_with_bonds
 

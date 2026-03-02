@@ -189,6 +189,35 @@ def test_minimize_full_chain_tunnel_mode():
     assert "Co-translational" in result["info"].get("message", "") or "tunnel" in result["info"].get("message", "").lower()
 
 
+def test_post_extrusion_refine():
+    """With post_extrusion_refine=True (default): message includes post-extrusion; with False, no refine stage."""
+    from .full_protein_minimizer import minimize_full_chain
+
+    result_refine = minimize_full_chain(
+        "MKFL",
+        max_iter=50,
+        quick=True,
+        simulate_ribosome_tunnel=True,
+        post_extrusion_refine=True,
+        tunnel_length=25.0,
+        cone_half_angle_deg=12.0,
+    )
+    assert "post-extrusion" in result_refine["info"].get("message", "").lower()
+    assert result_refine["ca_min"].shape == (4, 3)
+
+    result_no_refine = minimize_full_chain(
+        "MKFL",
+        max_iter=50,
+        quick=True,
+        simulate_ribosome_tunnel=True,
+        post_extrusion_refine=False,
+        tunnel_length=25.0,
+        cone_half_angle_deg=12.0,
+    )
+    assert "Co-translational" in result_no_refine["info"].get("message", "") or "tunnel" in result_no_refine["info"].get("message", "").lower()
+    assert result_no_refine["ca_min"].shape == (4, 3)
+
+
 if __name__ == "__main__":
     test_cone_constraint()
     test_plane_null_rotation()
@@ -200,4 +229,5 @@ if __name__ == "__main__":
     test_co_translational_minimize_short_chain()
     test_minimize_full_chain_backward_compat()
     test_minimize_full_chain_tunnel_mode()
+    test_post_extrusion_refine()
     print("All tests passed.")

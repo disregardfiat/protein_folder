@@ -33,7 +33,7 @@ pip install "jax[tpu]"
 
 ### Co-translational ribosome tunnel (optional)
 
-Simulate the ribosome exit tunnel: null search cone, plane at the lip, fast-pass spaghetti (rigid group + bell-end translations), and a short HKE min pass on each connection:
+Simulate the ribosome exit tunnel: null search cone, plane at the lip, fast-pass spaghetti (rigid group + bell-end translations), and a short HKE min pass on each connection. With `post_extrusion_refine=True` (default), the full HKE collapse/refine is run repeatedly after extrusion (no cone/plane) until two consecutive runs produce the same structure.
 
 ```bash
 python -c "

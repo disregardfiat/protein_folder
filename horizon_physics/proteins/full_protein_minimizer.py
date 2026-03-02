@@ -208,6 +208,7 @@ def minimize_full_chain(
     tunnel_length: float = 25.0,
     cone_half_angle_deg: float = 12.0,
     lip_plane_distance: float = 0.0,
+    post_extrusion_refine: bool = True,
     tunnel_axis: Optional[np.ndarray] = None,
     hke_above_tunnel_fraction: float = 0.5,
 ) -> Dict[str, object]:
@@ -233,6 +234,7 @@ def minimize_full_chain(
         tunnel_length: Length of tunnel in Å along extrusion axis (default 25.0). Residues with Cα inside this segment are cone-constrained.
         cone_half_angle_deg: Half-angle of the cone in degrees (default 12.0). Cα inside the tunnel must stay within this cone from the peptidyl transferase center.
         lip_plane_distance: Extra distance in Å beyond tunnel_length for the lip plane (default 0.0). Lip is at tunnel_length + lip_plane_distance along the axis.
+        post_extrusion_refine: When simulate_ribosome_tunnel=True, if True (default), run a final full HKE collapse/refine stage once the full chain is extruded: cone/plane constraints are removed and the existing two-stage logic (Rg-pull + horizon refine) is applied repeatedly until no Cα moved more than 0.5 Å between runs.
         tunnel_axis: (3,) unit vector for tunnel axis; default +Z. Chain is aligned so N-terminus is at origin and extrusion is along this axis.
         hke_above_tunnel_fraction: When simulate_ribosome_tunnel=True, HKE (connection-triggered L-BFGS) is applied only to residues above this fraction of the tunnel length (default 0.5 = 50%). The chain is built with the fast method (rigid group + bell-end); only the part above this threshold is updated by the min pass.
 
@@ -301,7 +303,34 @@ def minimize_full_chain(
                 r_bond_max=6.0,
                 hke_above_tunnel_fraction=hke_above_tunnel_fraction,
             )
-            if traj_file is not None:
+            # Post-extrusion refinement: full HKE two-stage (no cone/plane), repeat until no atom moved > post_extrusion_max_disp
+            if post_extrusion_refine:
+                total_refine_iter = 0
+                post_extrusion_max_disp = 0.5  # Å; run again if any Cα moved more than this
+                while True:
+                    ca_prev = ca_min.copy()
+                    ca_min, info_refine = _minimize_bonds_fast(
+                        ca_min,
+                        z_ca,
+                        max_iter=long_iter,
+                        fast_horizon=fast_horizon,
+                        collapse=True,
+                        collapse_frac=0.5,
+                        loose_r_max=8.0,
+                        collapse_init_steps=init_steps,
+                        k_rg_collapse=k_rg_collapse,
+                        trajectory_log=traj_file,
+                    )
+                    total_refine_iter += info_refine.get("n_iter", 0)
+                    max_disp = np.max(np.linalg.norm(ca_min - ca_prev, axis=1))
+                    if max_disp <= post_extrusion_max_disp:
+                        break
+                info = {
+                    **info_refine,
+                    "message": "Co-translational tunnel + post-extrusion HKE refine",
+                    "n_iter": info.get("n_iter", 0) + total_refine_iter,
+                }
+            elif traj_file is not None:
                 write_trajectory_frame(traj_file, 0, ca_min)
         # Standard HKE path (unchanged): fast path for long chains or L-BFGS for short
         elif n_res > 50:
