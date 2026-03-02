@@ -59,7 +59,8 @@ except Exception:
     hqiv_predict_structure_assembly = None
 
 USE_FAST_PREDICT = os.environ.get("USE_FAST_PREDICT", "").strip().lower() in ("1", "true", "yes")
-# CAMEO custom free-parameter key for ligand input (must match registration)
+# CAMEO custom free-parameter key for ligand input (must match registration).
+# Multiple ligands: LIGAND_KEY1=code1&LIGAND_KEY2=code2&... (key=value&key2=value2 style).
 LIGAND_KEY = os.environ.get("CASP_LIGAND_KEY", "ligand")
 FUNNEL_RADIUS = float(os.environ.get("FUNNEL_RADIUS", "10.0"))
 FUNNEL_RADIUS_EXIT = float(os.environ.get("FUNNEL_RADIUS_EXIT", "20.0"))
@@ -82,6 +83,54 @@ OUTPUTS_DIR = os.path.join(_output_base, "outputs")
 def _ensure_output_dirs() -> None:
     os.makedirs(PENDING_DIR, exist_ok=True)
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+
+def _gather_ligand_str(request) -> str | None:
+    """
+    Gather ligand input from request. Supports:
+    - Repeated key: LIGAND_KEY=blah&LIGAND_KEY=blah (form getlist order).
+    - Numbered keys: LIGAND_KEY1=code1&LIGAND_KEY2=code2&...
+    - JSON: LIGAND_KEY as string or array; plus LIGAND_KEY1, LIGAND_KEY2, ...
+    Returns newline-joined string for parse_ligands, or None if none present.
+    """
+    values: list[str] = []
+
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        val = data.get(LIGAND_KEY)
+        if isinstance(val, list):
+            values = [str(x).strip() for x in val if x is not None and str(x).strip()]
+        elif val is not None and str(val).strip():
+            values = [str(val).strip()]
+        # Numbered keys in order
+        numbered = [
+            (int(k[len(LIGAND_KEY):]), k)
+            for k in data
+            if isinstance(k, str) and k.startswith(LIGAND_KEY) and k[len(LIGAND_KEY):].isdigit()
+        ]
+        numbered.sort(key=lambda x: x[0])
+        for _, k in numbered:
+            v = data.get(k)
+            if v is not None and str(v).strip():
+                values.append(str(v).strip())
+    elif request.form:
+        # Repeated LIGAND_KEY=...&LIGAND_KEY=... (order preserved by getlist)
+        values = [s.strip() for s in request.form.getlist(LIGAND_KEY) if s and str(s).strip()]
+        # Then numbered LIGAND_KEY1, LIGAND_KEY2, ...
+        numbered = [
+            (int(k[len(LIGAND_KEY):]), k)
+            for k in request.form
+            if isinstance(k, str) and k.startswith(LIGAND_KEY) and k[len(LIGAND_KEY):].isdigit()
+        ]
+        numbered.sort(key=lambda x: x[0])
+        for _, k in numbered:
+            v = request.form.get(k)
+            if v is not None and str(v).strip():
+                values.append(str(v).strip())
+
+    if not values:
+        return None
+    return "\n".join(values)
 
 
 def _job_id() -> str:
@@ -767,13 +816,7 @@ def predict():
         return Response("No valid sequence found.\n", status=400, mimetype="text/plain")
 
     to_email, job_title = _get_email_and_title()
-    ligand_str = None
-    if request.is_json:
-        ligand_str = (request.get_json(silent=True) or {}).get(LIGAND_KEY)
-    if ligand_str is None and request.form:
-        ligand_str = request.form.get(LIGAND_KEY)
-    if ligand_str is not None and isinstance(ligand_str, str) and not ligand_str.strip():
-        ligand_str = None
+    ligand_str = _gather_ligand_str(request)
     job_id = _job_id()
     _write_pending_txt(job_id, job_title, to_email, len(seqs), [len(s) for s in seqs])
     _write_pending_request(job_id, sequences, job_title, to_email, ligand_str=ligand_str)
