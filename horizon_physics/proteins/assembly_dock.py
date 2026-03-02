@@ -11,7 +11,7 @@ MIT License. Python 3.10+. Numpy.
 
 from __future__ import annotations
 
-import threading
+import multiprocessing
 import numpy as np
 from typing import List, Tuple
 
@@ -218,7 +218,7 @@ def minimize_complex(
 ) -> Tuple[np.ndarray, dict]:
     """
     Minimize the two-chain complex (HKE-style: bonds within chains, horizon + clash; no funnel).
-    If converge_max_disp_ang is set (e.g. 0.5), stop when max displacement per residue
+    If converge_max_disp_ang is set (e.g. 0.5), stop when RMS Cα displacement per residue
     over the last step is below that threshold (Å). Returns (ca_combined, info).
     """
     from .gradient_descent_folding import _lbfgs_two_loop
@@ -300,24 +300,63 @@ def minimize_complex(
             step *= 0.5
         x_prev = x.copy()
         x = x_new
-        # Stop when max displacement per residue < threshold (e.g. 0.5 Å)
+        # Stop when RMS Cα displacement per residue < threshold (e.g. 0.5 Å)
         if converge_max_disp_ang is not None:
-            disp_per_res = np.linalg.norm(x.reshape(n, 3) - x_prev.reshape(n, 3), axis=1)
-            max_disp = float(np.max(disp_per_res))
-            if max_disp < converge_max_disp_ang:
-                pos_final = x.reshape(n, 3)
-                return pos_final, {
-                    "e_final": energy(x),
-                    "n_iter": it + 1,
-                    "success": True,
-                    "max_disp_ang": max_disp,
-                }
+            disp = x.reshape(n, 3) - x_prev.reshape(n, 3)
+            # Use Cα positions only: residues correspond to indices 1, 1+4, 1+8, ...
+            n_res = n  # upper bound; refined below
+            if n % 4 == 0:
+                n_res = n // 4
+            ca_disps: list[float] = []
+            for i in range(n_res):
+                idx = 4 * i + 1
+                if idx >= n:
+                    break
+                ca_disps.append(float(np.linalg.norm(disp[idx])))
+            if ca_disps:
+                rms_disp = float(np.sqrt(np.mean(np.square(ca_disps))))
+                if rms_disp < converge_max_disp_ang:
+                    pos_final = x.reshape(n, 3)
+                    return pos_final, {
+                        "e_final": energy(x),
+                        "n_iter": it + 1,
+                        "success": True,
+                        "rms_disp_ang": rms_disp,
+                    }
         grad_new = grad(x)
         s_list.append(x - x_prev)
         y_list.append(grad_new - grad_flat)
         grad_flat = grad_new
     pos_final = x.reshape(n, 3)
     return pos_final, {"e_final": energy(x), "n_iter": it + 1, "success": True}
+
+
+def _hke_chain_worker(
+    seq: str,
+    funnel_radius: float,
+    funnel_radius_exit: float,
+    funnel_stiffness: float,
+    hke_max_iter_s1: int,
+    hke_max_iter_s2: int,
+    hke_max_iter_s3: int,
+    gtol: float = 1e-5,
+    grouping_strategy: str = "residue",
+) -> dict:
+    """Run HKE-with-funnel for one chain. Module-level for multiprocessing pickling. Returns result dict."""
+    from .hierarchical import minimize_full_chain_hierarchical, hierarchical_result_for_pdb
+    pos, z_list = minimize_full_chain_hierarchical(
+        seq,
+        include_sidechains=False,
+        funnel_radius=funnel_radius,
+        funnel_stiffness=funnel_stiffness,
+        funnel_radius_exit=funnel_radius_exit,
+        max_iter_stage1=hke_max_iter_s1,
+        max_iter_stage2=hke_max_iter_s2,
+        max_iter_stage3=hke_max_iter_s3,
+        gtol=gtol,
+        grouping_strategy=grouping_strategy,
+    )
+    return hierarchical_result_for_pdb(pos, z_list, seq, include_sidechains=False)
 
 
 def run_two_chain_assembly_hke(
@@ -331,9 +370,11 @@ def run_two_chain_assembly_hke(
     hke_max_iter_s3: int,
     converge_max_disp_per_100_res: float = 0.5,
     max_dock_iter: int = 2000,
+    gtol: float = 1e-5,
+    grouping_strategy: str = "residue",
 ) -> Tuple[dict, dict, dict]:
     """
-    Run each chain through HKE-with-funnel on its own thread; map bond sites (placement);
+    Run each chain through HKE-with-funnel in its own process; map bond sites (placement);
     then run the complex with HKE (no funnel) until max displacement per residue
     < converge_max_disp_per_100_res * (total_residues / 100) Å (0.5 Å per 100 res:
     twice as many residues, twice as loose for the complex).
@@ -344,54 +385,24 @@ def run_two_chain_assembly_hke(
     except ImportError:
         raise ImportError("run_two_chain_assembly_hke requires horizon_physics.proteins.hierarchical") from None
 
-    result_a_ref: list = [None]
-    result_b_ref: list = [None]
-    err_ref: list = [None]
-
-    def run_chain_a() -> None:
+    kwargs = {
+        "funnel_radius": funnel_radius,
+        "funnel_radius_exit": funnel_radius_exit,
+        "funnel_stiffness": funnel_stiffness,
+        "hke_max_iter_s1": hke_max_iter_s1,
+        "hke_max_iter_s2": hke_max_iter_s2,
+        "hke_max_iter_s3": hke_max_iter_s3,
+        "gtol": gtol,
+        "grouping_strategy": grouping_strategy,
+    }
+    with multiprocessing.Pool(2) as pool:
+        async_a = pool.apply_async(_hke_chain_worker, (seq_a,), kwargs)
+        async_b = pool.apply_async(_hke_chain_worker, (seq_b,), kwargs)
         try:
-            pos, z_list = minimize_full_chain_hierarchical(
-                seq_a,
-                include_sidechains=False,
-                funnel_radius=funnel_radius,
-                funnel_stiffness=funnel_stiffness,
-                funnel_radius_exit=funnel_radius_exit,
-                max_iter_stage1=hke_max_iter_s1,
-                max_iter_stage2=hke_max_iter_s2,
-                max_iter_stage3=hke_max_iter_s3,
-            )
-            result_a_ref[0] = hierarchical_result_for_pdb(pos, z_list, seq_a, include_sidechains=False)
+            result_a = async_a.get()
+            result_b = async_b.get()
         except Exception as e:
-            err_ref[0] = e
-
-    def run_chain_b() -> None:
-        try:
-            pos, z_list = minimize_full_chain_hierarchical(
-                seq_b,
-                include_sidechains=False,
-                funnel_radius=funnel_radius,
-                funnel_stiffness=funnel_stiffness,
-                funnel_radius_exit=funnel_radius_exit,
-                max_iter_stage1=hke_max_iter_s1,
-                max_iter_stage2=hke_max_iter_s2,
-                max_iter_stage3=hke_max_iter_s3,
-            )
-            result_b_ref[0] = hierarchical_result_for_pdb(pos, z_list, seq_b, include_sidechains=False)
-        except Exception as e:
-            err_ref[0] = e
-
-    t_a = threading.Thread(target=run_chain_a)
-    t_b = threading.Thread(target=run_chain_b)
-    t_a.start()
-    t_b.start()
-    t_a.join()
-    t_b.join()
-    if err_ref[0] is not None:
-        raise err_ref[0]
-    if result_a_ref[0] is None or result_b_ref[0] is None:
-        raise RuntimeError("One or both HKE chain runs failed")
-    result_a = result_a_ref[0]
-    result_b = result_b_ref[0]
+            raise e
     return run_two_chain_assembly(
         result_a,
         result_b,

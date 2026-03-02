@@ -66,23 +66,24 @@ def _local_residue_com() -> Any:
 
 
 def generate_compact_start(
-    n_res: int,
+    n_groups: int,
     radius: float = 5.0,
     seed: Optional[int] = None,
 ) -> Any:
     """
     Generate DOFs so group COMs lie in a compact cloud (ball).
+    n_groups: number of kinematic groups (residues or segments).
     Returns dofs array: [t1(3), euler1(3), phi2, psi2, ..., phi_n, psi_n].
     """
     import numpy as np
-    if n_res == 0:
+    if n_groups == 0:
         return xp.array([], dtype=xp.float64)
     rng = np.random.default_rng(seed)
     # Points in ball
-    points = rng.standard_normal((n_res, 3))
+    points = rng.standard_normal((n_groups, 3))
     norms = np.linalg.norm(points, axis=1, keepdims=True)
     norms = np.where(norms < 1e-9, 1.0, norms)
-    points = points / norms * radius * (rng.uniform(0.3, 1.0, (n_res, 1)) ** (1.0 / 3.0))
+    points = points / norms * radius * (rng.uniform(0.3, 1.0, (n_groups, 1)) ** (1.0 / 3.0))
     bonds = _backbone_bonds()
     r_ca_c = bonds["Calpha_C"]
     r_c_n = bonds["C_N"]
@@ -96,7 +97,7 @@ def generate_compact_start(
     R_prev = np.eye(3)
     t_prev = t1
     com_prev = t_prev + R_prev @ local_com
-    for i in range(1, n_res):
+    for i in range(1, n_groups):
         direction = points[i] - com_prev
         d_norm = np.linalg.norm(direction)
         if d_norm < 1e-9:
@@ -166,7 +167,7 @@ class Protein:
         """
         sequence: one-letter amino acid sequence.
         ss_string: optional secondary structure (H/E/C). If None, predicted.
-        grouping_strategy: 'residue' | 'ss' | 'domain'.
+        grouping_strategy: 'residue' | 'ss' | 'domain' | 'helix_unit'.
         domain_ranges: for strategy 'domain', list of (start, end) residue indices.
         """
         self.sequence = sequence.strip().upper()
@@ -179,7 +180,8 @@ class Protein:
         self.domain_ranges = domain_ranges or []
         self._root = RigidGroup(name="root")
         self._groups: List[RigidGroup] = []
-        self._phi_psi: List[Tuple[float, float]] = []  # per residue (phi, psi) in degrees
+        self._phi_psi: List[Tuple[float, float]] = []  # per residue (phi, psi) or junction only for helix_unit
+        self._segment_phi_psi: List[Tuple[float, float]] = []  # junction (phi, psi) for helix_unit
         self._build_tree()
 
     def _build_tree(self) -> None:
@@ -193,6 +195,8 @@ class Protein:
             self._build_ss_aware(local_atoms)
         elif self.grouping_strategy == "domain":
             self._build_domain(local_atoms)
+        elif self.grouping_strategy == "helix_unit":
+            self._build_helix_units(local_atoms)
         else:
             self._build_per_residue(local_atoms)
 
@@ -247,6 +251,56 @@ class Protein:
         """Per-residue groups; domain_ranges can be used later for coarse 6DOF per domain."""
         self._build_per_residue(local_atoms)
 
+    def _segment_ranges_from_ss(self) -> List[Tuple[int, int, str]]:
+        """Contiguous SS segments: (start, end, 'H'|'E'|'C'). Merge H, merge E; C one-residue segments."""
+        out: List[Tuple[int, int, str]] = []
+        i = 0
+        while i < self.n_res:
+            ss = self.ss_string[i]
+            j = i
+            while j < self.n_res and self.ss_string[j] == ss:
+                j += 1
+            # Merge only H and E into multi-residue segments; C stays one per residue for flexibility
+            if ss == "C":
+                for k in range(i, j):
+                    out.append((k, k + 1, "C"))
+            else:
+                out.append((i, j, ss))
+            i = j
+        return out
+
+    def _build_helix_units(self, local_atoms: List[Tuple[str, Any, int]]) -> None:
+        """Tight helices (and strands) as single kinetic units: one RigidGroup per contiguous H or E segment, fixed internal geometry."""
+        from horizon_physics.proteins.peptide_backbone import ramachandran_alpha, ramachandran_beta
+        phi_a, psi_a = ramachandran_alpha()
+        phi_b, psi_b = ramachandran_beta()
+        segments = self._segment_ranges_from_ss()
+        self._groups = []
+        self._segment_phi_psi = []
+        for seg_idx, (start, end, ss) in enumerate(segments):
+            seg = RigidGroup(name=f"seg{seg_idx}")
+            # Ideal phi, psi for this SS
+            phi_deg, psi_deg = (float(phi_b), float(psi_b)) if ss == "E" else (float(phi_a), float(psi_a))
+            R_prev = xp.eye(3, dtype=xp.float64)
+            t_prev = xp.zeros(3, dtype=xp.float64)
+            for r in range(start, end):
+                res_group = RigidGroup(name=f"res{r}")
+                for name, pos, z in local_atoms:
+                    res_group.children.append((name, pos.copy(), z))
+                res_group.set_pose(R_prev, t_prev)
+                seg.children.append(res_group)
+                if r < end - 1:
+                    R_prev, t_prev = _place_next_group_from_phi_psi(R_prev, t_prev, phi_deg, psi_deg)
+            seg.last_pose_local = (R_prev, t_prev)
+            self._groups.append(seg)
+            if seg_idx > 0:
+                self._segment_phi_psi.append((float(phi_a), float(psi_a)))
+        self._root.children = list(self._groups)
+
+    def n_groups(self) -> int:
+        """Number of kinematic groups (residues or segments). For compact init and DOF size."""
+        return len(self._groups)
+
     def _initial_dofs(self) -> Any:
         """Initial DOF vector: 6 for first group (t=0, euler=0), then phi, psi per remaining residue."""
         if self.n_res == 0:
@@ -259,23 +313,41 @@ class Protein:
         return xp.array(dofs, dtype=xp.float64)
 
     def get_dofs(self) -> Any:
-        """Vector of all free DOFs: [t_x, t_y, t_z, euler_z, euler_y, euler_x] for first group, then [phi_i, psi_i] for i=1..n-1."""
+        """Vector of all free DOFs: [t_x, t_y, t_z, euler_z, euler_y, euler_x] for first group, then [phi_i, psi_i] for i=1..n-1 (or junctions for helix_unit)."""
         if self.n_res == 0:
             return xp.array([], dtype=xp.float64)
         R0, t0 = self._groups[0].get_pose()
         from .rigid_group import _rotation_to_euler
         euler = _rotation_to_euler(R0)
         dofs = [float(t0[0]), float(t0[1]), float(t0[2]), float(euler[0]), float(euler[1]), float(euler[2])]
-        for i in range(1, self.n_res):
-            phi, psi = self._phi_psi[i]
-            dofs.append(float(phi))
-            dofs.append(float(psi))
+        if self.grouping_strategy == "helix_unit":
+            for phi, psi in self._segment_phi_psi:
+                dofs.append(float(phi))
+                dofs.append(float(psi))
+        else:
+            for i in range(1, self.n_res):
+                phi, psi = self._phi_psi[i]
+                dofs.append(float(phi))
+                dofs.append(float(psi))
         return xp.array(dofs, dtype=xp.float64)
 
     def get_6dof_per_residue(self) -> Any:
         """Return (n_res, 6) world 6-DOF per residue: [t_x, t_y, t_z, euler_z, euler_y, euler_x] in Å and radians (ZYX)."""
         if self.n_res == 0:
             return xp.zeros((0, 6), dtype=xp.float64)
+        if self.grouping_strategy == "helix_unit":
+            from .rigid_group import _rotation_to_euler
+            rows = []
+            for seg in self._groups:
+                R_seg, t_seg = seg.get_pose()
+                for child in seg.children:
+                    if isinstance(child, RigidGroup):
+                        R_c, t_c = child.get_pose()
+                        R_w = R_seg @ R_c
+                        t_w = t_seg + R_seg @ xp.reshape(t_c, (3,))
+                        euler = _rotation_to_euler(R_w)
+                        rows.append(xp.concatenate([xp.ravel(t_w), xp.ravel(euler)]))
+            return xp.stack(rows, axis=0) if rows else xp.zeros((0, 6), dtype=xp.float64)
         rows = [self._groups[i].get_6dof() for i in range(self.n_res)]
         return xp.stack(rows, axis=0)
 
@@ -285,9 +357,20 @@ class Protein:
         if self.n_res == 0:
             return
         self._groups[0].set_6dof(dofs[:6])
-        for i in range(1, self.n_res):
-            self._phi_psi[i] = (float(dofs[6 + 2 * (i - 1)]), float(dofs[6 + 2 * (i - 1) + 1]))
-        self._apply_chain_poses()
+        if self.grouping_strategy == "helix_unit":
+            n_seg = len(self._groups)
+            for i in range(1, n_seg):
+                last_R, last_t = self._groups[i - 1].get_last_residue_pose()
+                phi = float(dofs[6 + 2 * (i - 1)])
+                psi = float(dofs[6 + 2 * (i - 1) + 1])
+                next_R, next_t = _place_next_group_from_phi_psi(last_R, last_t, phi, psi)
+                self._groups[i].set_pose(next_R, next_t)
+            for idx in range(len(self._segment_phi_psi)):
+                self._segment_phi_psi[idx] = (float(dofs[6 + 2 * idx]), float(dofs[6 + 2 * idx + 1]))
+        else:
+            for i in range(1, self.n_res):
+                self._phi_psi[i] = (float(dofs[6 + 2 * (i - 1)]), float(dofs[6 + 2 * (i - 1) + 1]))
+            self._apply_chain_poses()
 
     def forward_kinematics(self) -> Tuple[Any, Any]:
         """

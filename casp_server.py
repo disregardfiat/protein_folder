@@ -35,7 +35,11 @@ if __name__ != "__main__":
         sys.path.insert(0, _root)
 
 from horizon_physics.proteins.casp_submission import _parse_fasta
-from horizon_physics.proteins import full_chain_to_pdb, full_chain_to_pdb_complex
+from horizon_physics.proteins import (
+    full_chain_to_pdb,
+    full_chain_to_pdb_complex,
+    minimize_full_chain,
+)
 from horizon_physics.proteins.hierarchical import (
     minimize_full_chain_hierarchical,
     hierarchical_result_for_pdb,
@@ -286,6 +290,37 @@ def _send_assembly_email(
         app.logger.warning("SMTP assembly email failed: %s", e)
 
 
+def _send_job_failure_email(to_email: str, job_id: str, job_title: str | None, error_message: str) -> None:
+    """Send email on any single failure (includes error details)."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        return
+    subject = f"HQIV prediction failed (job {job_id})"
+    body = f"Job {job_id} (title={job_title or 'n/a'}) failed.\n\nError: {error_message}"
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    from_addr = _smtp_from_address()
+    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
+    msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        if cc_addr != to_email.strip().lower():
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
+    msg.attach(MIMEText(body, "plain"))
+    try:
+        import smtplib
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+    except Exception as e:
+        app.logger.warning("SMTP failure-email send failed: %s", e)
+
+
 def _send_failure_email(to_email: str, job_id: str, job_title: str | None) -> None:
     """Notify that the job failed after max attempts (no third try)."""
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
@@ -409,13 +444,35 @@ def process_pending_jobs() -> None:
         try:
             if USE_FAST_PREDICT and hqiv_predict_structure is not None:
                 pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
+                _move_to_outputs(job_id, pdb)
+                if to_email:
+                    _send_pdb_email(to_email, pdb, job_title)
+            elif len(seqs) == 2:
+                assembly = None
+                try:
+                    assembly = _predict_hke_assembly_with_complex(sequences)
+                except Exception as e:
+                    app.logger.warning("HKE 2-chain failed (pending), falling back to Cartesian: %s", e)
+                    assembly = _predict_cartesian_assembly_with_complex(sequences)
+                if assembly is not None:
+                    pdb_a, pdb_b, pdb_complex = assembly
+                    _move_to_outputs_assembly(job_id, pdb_a, pdb_b, pdb_complex)
+                    if to_email:
+                        _send_assembly_email(to_email, pdb_a, pdb_b, pdb_complex, job_title)
+                else:
+                    pdb = _predict_hke_assembly(seqs)
+                    _move_to_outputs(job_id, pdb)
+                    if to_email:
+                        _send_pdb_email(to_email, pdb, job_title)
             else:
                 pdb = _predict_hke_assembly(seqs) if len(seqs) > 1 else _predict_hke_single(seqs[0])
-            _move_to_outputs(job_id, pdb)
-            if to_email:
-                _send_pdb_email(to_email, pdb, job_title)
+                _move_to_outputs(job_id, pdb)
+                if to_email:
+                    _send_pdb_email(to_email, pdb, job_title)
         except Exception as e:
             app.logger.warning("Pending job %s retry failed: %s", job_id, e)
+            if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+                _send_job_failure_email(to_email, job_id, job_title, str(e))
 
 
 def _sequence_from_input(raw: str) -> str:
@@ -529,6 +586,39 @@ def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, 
     return (pdb_a, pdb_b, pdb_complex)
 
 
+def _predict_cartesian_assembly_with_complex(sequences: list[str]) -> tuple[str, str, str] | None:
+    """
+    Fallback for 2-chain: Cartesian minimizer per chain (avoids HKE overflow on long chains),
+    then placement + complex minimization. Same outputs as run_pending_assembly_job.py.
+    """
+    if len(sequences) != 2:
+        return None
+    seq_a = _sequence_from_input(sequences[0])
+    seq_b = _sequence_from_input(sequences[1])
+    if not seq_a or not seq_b:
+        return None
+    result_a = minimize_full_chain(
+        seq_a, max_iter=100, long_chain_max_iter=80, include_sidechains=False
+    )
+    result_b = minimize_full_chain(
+        seq_b, max_iter=100, long_chain_max_iter=80, include_sidechains=False
+    )
+    result_a, result_b, result_complex = run_two_chain_assembly(
+        result_a, result_b, max_dock_iter=60, converge_max_disp_per_100_res=0.5
+    )
+    pdb_a = full_chain_to_pdb(result_a, chain_id="A")
+    pdb_b = full_chain_to_pdb(result_b, chain_id="B")
+    pdb_complex = full_chain_to_pdb_complex(
+        result_complex["backbone_chain_a"],
+        result_complex["backbone_chain_b"],
+        result_a["sequence"],
+        result_b["sequence"],
+        chain_id_a="A",
+        chain_id_b="B",
+    )
+    return (pdb_a, pdb_b, pdb_complex)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return Response("OK\n", status=200, mimetype="text/plain")
@@ -557,7 +647,12 @@ def _run_job_in_background(job_id: str) -> None:
             if to_email:
                 _send_pdb_email(to_email, pdb, job_title)
         elif len(seqs) == 2:
-            assembly = _predict_hke_assembly_with_complex(sequences)
+            assembly = None
+            try:
+                assembly = _predict_hke_assembly_with_complex(sequences)
+            except Exception as e:
+                app.logger.warning("HKE 2-chain failed, falling back to Cartesian: %s", e)
+                assembly = _predict_cartesian_assembly_with_complex(sequences)
             if assembly is not None:
                 pdb_a, pdb_b, pdb_complex = assembly
                 _move_to_outputs_assembly(job_id, pdb_a, pdb_b, pdb_complex)
@@ -575,6 +670,8 @@ def _run_job_in_background(job_id: str) -> None:
                 _send_pdb_email(to_email, pdb, job_title)
     except Exception as e:
         app.logger.warning("Background job %s failed: %s", job_id, e)
+        if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+            _send_job_failure_email(to_email, job_id, job_title, str(e))
 
 
 @app.route("/predict", methods=["POST"])

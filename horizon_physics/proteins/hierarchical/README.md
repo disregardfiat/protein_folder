@@ -15,7 +15,7 @@ pos, atom_types = minimize_full_chain_hierarchical(
     "MKFLNDR",
     include_sidechains=True,
     device="cpu",  # or "cuda", "tpu" when JAX is available
-    grouping_strategy="residue",  # or "ss", "domain"
+    grouping_strategy="residue",  # or "ss", "domain", "helix_unit" (tight H/E as single kinetic units)
 )
 ```
 

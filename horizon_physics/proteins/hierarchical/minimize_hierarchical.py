@@ -133,7 +133,7 @@ def _flat_cartesian_refinement(
     n_res: Optional[int] = None,
 ) -> Tuple[Any, float]:
     """Refine positions with existing grad_full (NumPy path).
-    If converge_max_disp_ang and n_res are set, stop when max Cα displacement per step < threshold (0.5 Å per 100 res).
+    If converge_max_disp_ang and n_res are set, stop when RMS Cα displacement per step < threshold (0.5 Å per 100 res).
     """
     from horizon_physics.proteins.folding_energy import e_tot_ca_with_bonds, grad_full
     import numpy as np
@@ -155,15 +155,18 @@ def _flat_cartesian_refinement(
         pos_prev = pos.copy()
         pos = pos - step * g
         if converge_max_disp_ang is not None and n_res is not None:
-            # Max displacement per residue (Cα only, same as complex minimizer)
-            max_disp = 0.0
-            for i in range(min(n_res, pos.shape[0] // 4)):
+            # RMS displacement per residue (Cα only, same rule as complex minimizer)
+            ca_disps = []
+            max_res = min(n_res, pos.shape[0] // 4)
+            for i in range(max_res):
                 idx = 4 * i + 1
                 if idx < pos.shape[0]:
                     d = float(np.linalg.norm(pos[idx] - pos_prev[idx]))
-                    max_disp = max(max_disp, d)
-            if max_disp < converge_max_disp_ang:
-                break
+                    ca_disps.append(d)
+            if ca_disps:
+                rms_disp = float(np.sqrt(np.mean(np.square(ca_disps))))
+                if rms_disp < converge_max_disp_ang:
+                    break
     e_final = float(e_tot_ca_with_bonds(pos, z_np))
     return pos, e_final
 
@@ -232,7 +235,7 @@ def run_staged_minimization(
     try:
         # Compact init for Stage 1 (group COMs in a ball; funnel soft-bounds COMs in 1-2 when set)
         if use_compact_init and protein.n_res > 1:
-            dofs = generate_compact_start(protein.n_res, radius=5.0, seed=42)
+            dofs = generate_compact_start(protein.n_groups(), radius=5.0, seed=42)
             protein.set_dofs(dofs)
             dofs = protein.get_dofs()
         _log_frame()
@@ -356,7 +359,7 @@ def minimize_full_chain_hierarchical(
         sequence: One-letter amino acid sequence.
         include_sidechains: If True, Cβ is added after backbone (same as flat pipeline; side-chain packing optional).
         device: 'cuda', 'tpu', or 'cpu' for JAX placement (when JAX available).
-        grouping_strategy: 'residue' | 'ss' | 'domain'.
+        grouping_strategy: 'residue' | 'ss' | 'domain' | 'helix_unit' (tight H/E segments as single kinetic units).
         ss_string: Optional SS string (H/E/C); if None, predicted.
         domain_ranges: For grouping_strategy='domain', list of (start, end).
         max_iter_stage1/2/3: Iteration limits per stage.
@@ -365,7 +368,7 @@ def minimize_full_chain_hierarchical(
         funnel_stiffness: Soft-wall stiffness when funnel_radius is set.
         funnel_radius_exit: Cone exit radius (Å); default 2× funnel_radius. Set = funnel_radius for cylinder.
         converge_max_disp_per_100_res: If set (default 0.5), stage-3 Cartesian refinement stops when
-            max Cα displacement per step < 0.5 * n_res/100 Å (same tolerance as complex minimizer).
+            RMS Cα displacement per step < 0.5 * n_res/100 Å (same tolerance as complex minimizer).
 
     Returns:
         pos: (N, 3) NumPy array in Å (backbone N, CA, C, O per residue).

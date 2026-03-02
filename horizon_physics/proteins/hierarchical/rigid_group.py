@@ -56,12 +56,14 @@ class RigidGroup:
 
     Energy is evaluated on all descendant atom positions (horizon + clash + custom).
     Children are in local frame; world pose = (R, t) applied to local.
+    last_pose_local: when set, (R, t) of last residue in this group's frame (for segment chains).
     """
 
     R: Any = field(default_factory=lambda: xp.eye(3, dtype=xp.float64))
     t: Any = field(default_factory=lambda: xp.zeros(3, dtype=xp.float64))
     children: List[ChildType] = field(default_factory=list)
     name: str = ""
+    last_pose_local: Optional[Tuple[Any, Any]] = None
 
     def get_pose(self) -> Tuple[Any, Any]:
         """Return (R (3,3), t (3,))."""
@@ -86,6 +88,15 @@ class RigidGroup:
         dof = xp.asarray(dof)
         self.t = dof[:3]
         self.R = _euler_to_rotation(dof[3:6])
+
+    def get_last_residue_pose(self) -> Tuple[Any, Any]:
+        """If last_pose_local is set, return (R, t) of last residue in world (this group's frame). Else return get_pose()."""
+        if self.last_pose_local is None:
+            return self.get_pose()
+        R_l, t_l = self.last_pose_local
+        R_l = xp.asarray(R_l, dtype=xp.float64)
+        t_l = xp.reshape(xp.asarray(t_l, dtype=xp.float64), (3,))
+        return (self.R @ R_l, self.t + self.R @ t_l)
 
     def _collect_positions_recursive(
         self,
